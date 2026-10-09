@@ -1,0 +1,35 @@
+# Optional Compose deployment (native systemd is the primary mode).
+#   AUDIO_GID=$(getent group audio | cut -d: -f3) docker compose -f deploy/docker/compose.yaml up -d
+# Unplug/replug must be re-tested in this mode: /dev/snd is bind-mounted, so new device nodes created
+# on replug are visible, but the cgroup device rule below must allow the ALSA char major (116).
+services:
+  noise-collector:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: noise-collector:0.1.0
+    platform: linux/arm64
+    restart: unless-stopped
+    stop_grace_period: 45s
+    init: false               # tini is the entrypoint
+    read_only: true
+    tmpfs:
+      - /run/noise-collector:mode=0750,uid=10001
+      - /tmp
+    group_add:
+      - "${AUDIO_GID:?set AUDIO_GID to the host audio group id}"
+    volumes:
+      - /dev/snd:/dev/snd                       # bind mount (not `devices:`) so replugged nodes appear
+      - /var/lib/noise-collector:/var/lib/noise-collector
+      - /etc/noise-collector/collector.toml:/etc/noise-collector/collector.toml:ro
+      - /etc/noise-collector/credentials.toml:/etc/noise-collector/credentials.toml:ro
+    device_cgroup_rules:
+      - "c 116:* rmw"                           # ALSA only
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    # No privileged mode, no host PID, no Docker socket, no published ports.
+    network_mode: bridge
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "5"}

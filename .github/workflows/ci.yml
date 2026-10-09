@@ -1,0 +1,25 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "${{ matrix.python }}"}
+      - run: sudo apt-get update && sudo apt-get install -y libportaudio2 libsndfile1
+      - run: pip install --require-hashes -r requirements-dev.lock && pip install --no-deps -e .
+      - run: python scripts/design_filters.py --check
+      - run: python scripts/export_contract.py --check
+      - run: pytest -q
+  arm64-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - run: docker buildx build --platform linux/arm64 -f deploy/docker/Dockerfile -t noise-collector:ci --load .
+      - run: docker run --rm --platform linux/arm64 noise-collector:ci sh -c 'noise-collector synth engine /tmp/e.wav --duration 240 && noise-collector replay /tmp/e.wav --state-dir /tmp/s'

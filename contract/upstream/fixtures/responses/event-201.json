@@ -1,0 +1,13 @@
+{
+  "request_id": "019a0f3d-0a1b-7d5e-8f6a-7b8c9d0e1f2a",
+  "server_received_at": "2026-10-08T12:16:20.233Z",
+  "event_id": "7f1c2b9e-3a4d-4e5f-8a6b-9c0d1e2f3a4b",
+  "revision": 2,
+  "outcome": "stored",
+  "applied_to_projection": true,
+  "current_revision": 2,
+  "detection_state": "finalized",
+  "completeness_state": "pending",
+  "recording_state": "pending",
+  "first_received_at": "2026-10-08T12:15:36.087Z"
+}

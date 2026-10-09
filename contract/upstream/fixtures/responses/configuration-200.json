@@ -1,0 +1,132 @@
+{
+  "request_id": "019a0f3d-5f6a-7cad-9e1f-2a3b4c5d6e7f",
+  "server_received_at": "2026-10-08T12:16:01.000Z",
+  "revision": 4,
+  "sha256": "3b1f5c0d8e7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c",
+  "issued_at": "2026-10-08T12:00:00.000Z",
+  "applied_revision": 3,
+  "configuration": {
+    "schema_version": 1,
+    "device_id": "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d",
+    "revision": 4,
+    "reporting_interval_seconds": 30,
+    "heartbeat_interval_seconds": 60,
+    "measurement_interval_ms": 1000,
+    "channels": [
+      {
+        "channel": "mic-1",
+        "enabled": true,
+        "metrics": [
+          "laeq_db",
+          "lafmax_db",
+          "lceq_db",
+          "lcpeak_db",
+          "low_frequency_leq_db",
+          "rms_dbfs"
+        ],
+        "bands_enabled": false,
+        "measurement_profile_id": "2fc235ef-6f5b-48d1-8d35-083dfdd5a6e9",
+        "deployment_id": "ab6de18e-f8aa-4444-aed3-71d3464f07ea",
+        "calibration_id": "0e745c21-fc8f-40da-9113-7a158c913fc6",
+        "calibration_state": "calibrated"
+      }
+    ],
+    "recording": {
+      "enabled": true,
+      "format": "audio/flac",
+      "pre_roll_seconds": 10,
+      "post_roll_seconds": 30,
+      "max_segment_duration_seconds": 600
+    },
+    "detection": {
+      "rule_version": "owner-rules-v1",
+      "absolute": {
+        "enabled": false,
+        "metric": "lafmax_db",
+        "level_db": null
+      },
+      "baseline_relative": {
+        "enabled": true,
+        "metric": "lafmax_db",
+        "delta_db": 15.0,
+        "baseline_window_seconds": 300
+      },
+      "min_event_duration_ms": 1000,
+      "merge_gap_ms": 5000,
+      "observation_period_until": "2026-10-15T00:00:00.000Z"
+    },
+    "local_retention": {
+      "measurement_days": 7,
+      "audio_days": 7,
+      "max_disk_usage_percent": 80
+    }
+  },
+  "provenance": {
+    "measurement_profiles": [
+      {
+        "id": "2fc235ef-6f5b-48d1-8d35-083dfdd5a6e9",
+        "channel": "mic-1",
+        "revision": 1,
+        "calibration_state": "calibrated",
+        "microphone_model": "miniDSP UMIK-1",
+        "microphone_serial": "7103946",
+        "audio_interface": "USB (UAC1)",
+        "gain_description": "UMIK-1 18 dB gain setting; ALSA capture volume at maximum",
+        "calibration_application_method": "sensitivity from calibrator check; serial-specific 90° response correction",
+        "supported_metrics": [
+          "laeq_db",
+          "lafmax_db",
+          "lceq_db",
+          "lcpeak_db",
+          "low_frequency_leq_db",
+          "rms_dbfs"
+        ],
+        "sample_rate_hz": 48000,
+        "gain_db": 12.0,
+        "low_frequency_band_hz": [
+          20.0,
+          125.0
+        ],
+        "band_definitions": null,
+        "content_hash": "<sha256>"
+      }
+    ],
+    "deployments": [
+      {
+        "id": "ab6de18e-f8aa-4444-aed3-71d3464f07ea",
+        "revision": 1,
+        "effective_at": "2026-10-01T00:00:00.000Z",
+        "content_hash": "<sha256>"
+      }
+    ],
+    "calibrations": [
+      {
+        "id": "0e745c21-fc8f-40da-9113-7a158c913fc6",
+        "channel": "mic-1",
+        "revision": 1,
+        "calibration_state": "calibrated",
+        "reference_method": "94 dB / 1 kHz acoustic calibrator",
+        "reference_device": "Class 1 calibrator SN 12345",
+        "reference_level_db": 94.0,
+        "reference_frequency_hz": 1000.0,
+        "sensitivity_mv_per_pa": null,
+        "sensitivity_dbfs_at_94db": -25.32,
+        "gain_configuration": "UMIK-1 18 dB; capture volume 100%",
+        "application_method": "agent scale from sensitivity_dbfs_at_94db",
+        "correction_metadata": null,
+        "performed_at": "2026-10-01T15:00:00.000Z",
+        "attachments": [
+          {
+            "id": "019a0f3d-7e7e-7000-8000-00000000c41f",
+            "purpose": "frequency_response",
+            "filename": "7103946_90deg.txt",
+            "byte_size": 7212,
+            "sha256": "c0a8e6b1f2d3c4b5a69788796a5b4c3d2e1f00112233445566778899aabbccdd",
+            "download_path": "/api/v1/device/calibrations/0e745c21-fc8f-40da-9113-7a158c913fc6/attachments/019a0f3d-7e7e-7000-8000-00000000c41f"
+          }
+        ],
+        "content_hash": "<sha256>"
+      }
+    ]
+  }
+}

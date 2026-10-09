@@ -1,0 +1,16 @@
+{
+  "request_id": "019a0f3c-8f30-7c4d-9e5f-6a7b8c9d0e1f",
+  "server_received_at": "2026-10-08T12:17:30.100Z",
+  "error": {
+    "code": "validation_failed",
+    "message": "The batch failed validation; nothing was stored.",
+    "retry": "never",
+    "permanent": true,
+    "details": {
+      "errors": {
+        "records.7.captured_at": ["Must be aligned to a UTC second boundary."],
+        "records.9.peak_db": ["Unknown field."]
+      }
+    }
+  }
+}

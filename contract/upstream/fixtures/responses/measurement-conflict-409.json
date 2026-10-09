@@ -1,0 +1,16 @@
+{
+  "request_id": "019a0f3c-7e2f-7b3c-8d4e-5f6a7b8c9d0e",
+  "server_received_at": "2026-10-08T12:17:01.020Z",
+  "error": {
+    "code": "measurement_conflict",
+    "message": "One or more sequence identities were already stored with different values; the whole batch was rejected.",
+    "retry": "never",
+    "permanent": true,
+    "details": {
+      "conflicts": [
+        { "channel": "mic-1", "boot_id": "c97dba94-d806-45bd-b14f-34d44a10f534", "sequence": 452, "reason": "changed_payload" }
+      ],
+      "conflict_count": 1
+    }
+  }
+}

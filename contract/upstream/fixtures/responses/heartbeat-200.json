@@ -1,0 +1,9 @@
+{
+  "request_id": "019a0f3d-4e5f-7b9c-8d0e-1f2a3b4c5d6e",
+  "server_received_at": "2026-10-08T12:16:00.120Z",
+  "desired_config_revision": 4,
+  "applied_config_revision": 3,
+  "configuration_pending": true,
+  "heartbeat_interval_seconds": 60,
+  "reporting_interval_seconds": 30
+}

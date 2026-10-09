@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "event_id": "7f1c2b9e-3a4d-4e5f-8a6b-9c0d1e2f3a4b",
+  "revision": 2,
+  "sent_at": "2026-10-08T12:16:20.000Z",
+  "channel": "mic-1",
+  "deployment_id": "{{DEPLOYMENT_ID}}",
+  "profile_id": "{{PROFILE_ID}}",
+  "calibration_id": "{{CALIBRATION_ID}}",
+  "configuration_revision": "{{CONFIGURATION_REVISION}}",
+  "detection_state": "finalized",
+  "started_at": "2026-10-08T12:15:30.000Z",
+  "ended_at": "2026-10-08T12:15:42.000Z",
+  "detection": {
+    "rule_version": "owner-rules-v1",
+    "trigger_metric": "lafmax_db",
+    "trigger_kind": "baseline_relative",
+    "threshold_db": 15.0,
+    "trigger_value_db": 86.2,
+    "baseline_db": 51.8,
+    "baseline_method": "rolling 5-minute median LAeq"
+  },
+  "summary": {
+    "laeq_db": 76.3,
+    "lafmax_db": 101.4,
+    "lceq_db": 89.9,
+    "lcpeak_db": 104.3,
+    "low_frequency_leq_db": 86.0,
+    "rms_dbfs": -20.2,
+    "duration_ms": 12000
+  },
+  "recording": {
+    "expected": true,
+    "started_at": "2026-10-08T12:15:20.000Z",
+    "ended_at": "2026-10-08T12:16:12.000Z",
+    "expected_segments": 1
+  },
+  "quality_flags": ["clipping"]
+}

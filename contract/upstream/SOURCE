@@ -1,0 +1,10 @@
+9ff8498fe394ff847da540654cfa7e571e5c7458
+ M app/Filament/Resources/NoiseEvents/NoiseEventResource.php
+ M app/Models/Attachment.php
+ M app/Models/DeviceCalibration.php
+ M app/Models/NoiseEvent.php
+ M app/Services/Devices/DeviceConfigurationService.php
+ M app/Services/Devices/RecordHeartbeat.php
+ M docs/openapi/device-api-v1.yaml
+ M docs/openapi/fixtures/responses/configuration-200.json
+?? app/Http/Controllers/DeviceApi/CalibrationAttachmentController.php

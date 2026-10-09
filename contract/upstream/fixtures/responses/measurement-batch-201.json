@@ -1,0 +1,15 @@
+{
+  "request_id": "019a0f3c-6d1e-7a2b-9c3d-4e5f6a7b8c9d",
+  "server_received_at": "2026-10-08T12:16:05.412Z",
+  "batch_id": "b9917467-e48c-4d4f-9725-44559747f84b",
+  "status": "accepted",
+  "record_count": 3,
+  "inserted_count": 3,
+  "duplicate_count": 0,
+  "accepted_interval": {
+    "start": "2026-10-08T12:15:30.000Z",
+    "end": "2026-10-08T12:15:33.000Z"
+  },
+  "received_at": "2026-10-08T12:16:05.412Z",
+  "replayed": false
+}

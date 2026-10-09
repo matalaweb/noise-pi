@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Noise Collector Live</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1b1f24; --muted: #5f6b7a; --line: #e2e6eb;
+  --laeq: #2463eb; --lafmax: #d9480f; --lceq: #7b4fd6; --lf: #0f8a6a; --dbfs: #8a6d00;
+  --event: rgba(217, 72, 15, 0.12); --event-edge: rgba(217, 72, 15, 0.45);
+  --ok: #157f3b; --warn: #b26a00; --bad: #c62828; --pill: #eef1f5;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1216; --panel: #171b21; --ink: #e6e9ee; --muted: #9aa5b4; --line: #2a313b;
+    --laeq: #6ea0ff; --lafmax: #ff8a4c; --lceq: #b494ff; --lf: #3fd0a6; --dbfs: #e3c25a;
+    --event: rgba(255, 138, 76, 0.14); --event-edge: rgba(255, 138, 76, 0.5);
+    --ok: #4cc27a; --warn: #f0b04a; --bad: #ff6b6b; --pill: #222832;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; justify-content: space-between; padding: 14px 16px 8px; }
+h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: .1px; }
+.pills { display: flex; flex-wrap: wrap; gap: 6px; }
+.pill { background: var(--pill); border-radius: 999px; padding: 3px 10px; font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+.pill b { font-weight: 600; color: var(--ink); }
+.pill.ok b { color: var(--ok); } .pill.warn b { color: var(--warn); } .pill.bad b { color: var(--bad); }
+main { padding: 0 16px 24px; display: grid; gap: 12px; max-width: 1400px; margin: 0 auto; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; min-width: 0; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; }
+.tile { padding: 8px 10px; border-radius: 8px; background: var(--pill); }
+.tile .k { font-size: 12px; color: var(--muted); }
+.tile .v { font-size: 26px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.tile .u { font-size: 12px; color: var(--muted); margin-left: 3px; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin-bottom: 8px; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg button { background: transparent; color: var(--muted); border: 0; padding: 5px 10px; font: inherit; cursor: pointer; }
+.seg button[aria-pressed="true"] { background: var(--pill); color: var(--ink); font-weight: 600; }
+.toggles { display: flex; flex-wrap: wrap; gap: 10px; }
+.toggles label { display: inline-flex; gap: 5px; align-items: center; cursor: pointer; color: var(--muted); font-size: 13px; }
+.sw { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+#chartWrap { position: relative; height: min(52vh, 420px); min-height: 240px; }
+canvas { width: 100%; height: 100%; display: block; }
+#tip { position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font-size: 12px; display: none; box-shadow: 0 4px 16px rgba(0,0,0,.12); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.note { color: var(--muted); font-size: 12.5px; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); font-size: 13px; }
+th { color: var(--muted); font-weight: 600; }
+.tablewrap { overflow-x: auto; }
+.flag { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 6px; background: var(--pill); color: var(--muted); margin-right: 3px; }
+.empty { color: var(--muted); padding: 10px 2px; }
+@media (max-width: 600px) { .tile .v { font-size: 22px; } header { padding-top: 10px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Noise collector — live</h1>
+  <div class="pills" id="pills"><span class="pill">connecting…</span></div>
+</header>
+<main>
+  <section class="panel">
+    <div class="tiles" id="tiles"></div>
+    <p class="note" id="modeNote"></p>
+  </section>
+  <section class="panel">
+    <div class="toolbar">
+      <div class="seg" id="windows" role="group" aria-label="Time window"></div>
+      <div class="toggles" id="toggles"></div>
+    </div>
+    <div id="chartWrap"><canvas id="chart" aria-label="Sound level chart" role="img"></canvas><div id="tip"></div></div>
+    <p class="note">One point per UTC second as committed by the collector. Shaded spans are candidate disturbances (not source identifications). Dashed: current baseline and trigger threshold. Breaks are omitted seconds (gaps, settling, data loss).</p>
+  </section>
+  <section class="panel">
+    <h2 style="font-size:15px;margin:0 0 6px">Recent events</h2>
+    <div class="tablewrap"><table><thead><tr><th>Start</th><th>Duration</th><th>Trigger</th><th>Leq</th><th>Max</th><th>Recording</th><th>Upload</th><th>Flags</th></tr></thead><tbody id="events"></tbody></table></div>
+  </section>
+</main>
+<script>
+"use strict";
+const SERIES = [
+  {key: "laeq_db", label: "LAeq", unit: "dB(A)", color: "--laeq", spl: true, on: true},
+  {key: "lafmax_db", label: "LAFmax", unit: "dB(A)", color: "--lafmax", spl: true, on: true},
+  {key: "lceq_db", label: "LCeq", unit: "dB(C)", color: "--lceq", spl: true, on: false},
+  {key: "low_frequency_leq_db", label: "LF Leq 20–125 Hz", unit: "dB", color: "--lf", spl: true, on: false},
+  {key: "rms_dbfs", label: "RMS", unit: "dBFS", color: "--dbfs", spl: false, on: false},
+];
+const WINDOWS = [[300, "5 min"], [900, "15 min"], [3600, "1 h"], [21600, "6 h"], [86400, "24 h"]];
+const state = {window: 900, points: [], events: [], status: null, splAvailable: true, hover: null};
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const fmt = (v, d = 1) => v == null || Number.isNaN(v) ? "–" : v.toFixed(d);
+const timeStr = (t, secs) => new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: secs ? "2-digit" : undefined});
+
+function el(tag, attrs = {}, text) { const e = document.createElement(tag); Object.assign(e, attrs); if (text != null) e.textContent = text; return e; }
+
+function buildControls() {
+  const w = document.getElementById("windows");
+  for (const [s, label] of WINDOWS) {
+    const b = el("button", {type: "button"}, label);
+    b.setAttribute("aria-pressed", String(s === state.window));
+    b.onclick = () => { state.window = s; [...w.children].forEach(c => c.setAttribute("aria-pressed", String(c === b))); load(); };
+    w.appendChild(b);
+  }
+  renderToggles();
+}
+
+function renderToggles() {
+  const t = document.getElementById("toggles");
+  t.replaceChildren();
+  for (const s of SERIES) {
+    if (s.spl !== state.splAvailable && !(s.key === "rms_dbfs")) continue;
+    const id = "t_" + s.key;
+    const cb = el("input", {type: "checkbox", id, checked: s.on});
+    cb.onchange = () => { s.on = cb.checked; draw(); };
+    const lab = el("label", {htmlFor: id});
+    const sw = el("span", {className: "sw"}); sw.style.background = css(s.color);
+    lab.append(cb, sw, document.createTextNode(s.label));
+    t.appendChild(lab);
+  }
+}
+
+async function getJSON(url) { const r = await fetch(url, {credentials: "same-origin"}); if (!r.ok) throw new Error(r.status); return r.json(); }
+
+async function load() {
+  const [m, e] = await Promise.all([getJSON(`/api/measurements?seconds=${state.window}`), getJSON(`/api/events?seconds=${Math.max(state.window, 86400)}`)]);
+  state.points = m.points; state.events = e.events;
+  decideMode();
+  renderTiles(); renderEvents(); draw();
+  connect(m.latest);
+}
+
+let es = null;
+function connect(since) {
+  if (es) es.close();
+  es = new EventSource(`/api/stream?since=${since || 0}`);
+  es.addEventListener("points", ev => {
+    const pts = JSON.parse(ev.data);
+    state.points.push(...pts);
+    const cutoff = (state.points.at(-1)?.t || 0) - state.window;
+    while (state.points.length && state.points[0].t < cutoff) state.points.shift();
+    decideMode(); renderTiles(); draw();
+  });
+  es.addEventListener("status", ev => {
+    const s = JSON.parse(ev.data); const prevEvent = state.status?.detection?.event_id;
+    state.status = s; renderPills(); draw();
+    if (s.detection?.event_id !== prevEvent) getJSON(`/api/events?seconds=86400`).then(e => { state.events = e.events; renderEvents(); draw(); });
+  });
+  es.onerror = () => renderPills(true);
+}
+
+function decideMode() {
+  const recent = state.points.slice(-30);
+  const spl = recent.some(p => p.laeq_db != null || p.lafmax_db != null);
+  if (spl !== state.splAvailable) {
+    state.splAvailable = spl;
+    for (const s of SERIES) s.on = spl ? ["laeq_db", "lafmax_db"].includes(s.key) : s.key === "rms_dbfs";
+    renderToggles();
+  }
+  const mode = state.status?.profile_mode;
+  document.getElementById("modeNote").textContent = !spl
+    ? "No absolute scale for this channel: showing digital RMS level (dBFS), which is not a sound pressure level."
+    : (mode === "estimated" ? "Estimated profile: SPL values are estimates." : "Levels in dB re 20 µPa per the applied calibrated profile. DIY instrument, not a certified meter.");
+}
+
+function renderTiles() {
+  const last = [...state.points].reverse().find(p => p.ok);
+  const t = document.getElementById("tiles"); t.replaceChildren();
+  for (const s of SERIES) {
+    if (state.splAvailable ? (!s.spl && s.key !== "rms_dbfs") : s.spl) continue;
+    const d = el("div", {className: "tile"});
+    const v = el("div", {className: "v"}, fmt(last?.[s.key]));
+    v.appendChild(el("span", {className: "u"}, s.unit));
+    d.append(el("div", {className: "k"}, s.label), v);
+    t.appendChild(d);
+  }
+  const age = el("div", {className: "tile"});
+  age.append(el("div", {className: "k"}, "Last second"), el("div", {className: "v", style: "font-size:18px"}, last ? timeStr(last.t, true) : "–"));
+  t.appendChild(age);
+}
+
+function pill(label, value, cls) { const p = el("span", {className: "pill " + (cls || "")}); p.append(label + " "); p.appendChild(el("b", {}, value)); return p; }
+
+function renderPills(disconnected) {
+  const s = state.status, box = document.getElementById("pills"); box.replaceChildren();
+  if (disconnected || !s) { box.appendChild(pill("Dashboard", "reconnecting", "warn")); return; }
+  const stale = s.acquisition_age_s == null || s.acquisition_age_s > 15;
+  box.appendChild(pill("Microphone", stale ? "no status" : (s.microphone_state || "?"), stale ? "bad" : (s.microphone_state === "ok" ? "ok" : "bad")));
+  box.appendChild(pill("Capture", s.durable_capture === "critical" ? "storage fault" : "durable", s.durable_capture === "critical" ? "bad" : "ok"));
+  const sync = s.clock?.synchronized; box.appendChild(pill("Clock", sync ? "synced" : (sync === false ? "not synced" : "unknown"), sync ? "ok" : "warn"));
+  const d = s.detection; if (d) box.appendChild(pill("Detector", d.event_id ? "event active" : d.state, d.event_id ? "warn" : (d.state === "warming" ? "warn" : "ok")));
+  const q = s.delivery?.queued_measurements; box.appendChild(pill("Upload", s.delivery?.auth_blocked ? "auth blocked" : (q ? `${q} queued` : "up to date"), s.delivery?.auth_blocked ? "bad" : (q > 120 ? "warn" : "ok")));
+  if (s.storage?.state && s.storage.state !== "ok") box.appendChild(pill("Storage", s.storage.state, "warn"));
+}
+
+function renderEvents() {
+  const tb = document.getElementById("events"); tb.replaceChildren();
+  if (!state.events.length) { const tr = el("tr"); tr.appendChild(el("td", {colSpan: 8, className: "empty"}, "No candidate events in the last 24 h.")); tb.appendChild(tr); return; }
+  for (const e of state.events.slice(0, 50)) {
+    const tr = el("tr");
+    const dur = e.summary?.duration_ms != null ? `${Math.round(e.summary.duration_ms / 1000)} s` : (e.detection_state === "open" ? "ongoing" : "–");
+    const trig = e.trigger ? `${e.trigger.trigger_metric} ${e.trigger.trigger_kind === "absolute" ? "≥" : "+"}${fmt(e.trigger.threshold_db, 0)}` : "–";
+    const leq = e.summary?.laeq_db ?? e.summary?.rms_dbfs, mx = e.summary?.lafmax_db;
+    const rec = e.recording?.expected ? (e.recording.expected_segments ? `${e.recording.expected_segments} seg` : "recording") : "none";
+    const flags = el("td"); for (const f of e.quality_flags || []) flags.appendChild(el("span", {className: "flag"}, f.replaceAll("_", " ")));
+    tr.append(el("td", {}, new Date(e.start_second * 1000).toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit"})),
+      el("td", {}, dur), el("td", {}, trig), el("td", {}, fmt(leq)), el("td", {}, fmt(mx)), el("td", {}, rec), el("td", {}, e.upload || "–"), flags);
+    tb.appendChild(tr);
+  }
+}
+
+const canvas = document.getElementById("chart"), tip = document.getElementById("tip");
+const PAD = {l: 46, r: 12, t: 10, b: 24};
+
+function scales(w, h) {
+  const pts = state.points, active = SERIES.filter(s => s.on);
+  const tmax = pts.length ? pts.at(-1).t + 1 : Date.now() / 1000, tmin = tmax - state.window;
+  let lo = Infinity, hi = -Infinity;
+  for (const p of pts) for (const s of active) { const v = p[s.key]; if (v != null) { lo = Math.min(lo, v); hi = Math.max(hi, v); } }
+  for (const r of state.status?.detection?.rules || []) if (active.some(s => s.key === r.metric) && r.threshold_db != null) { hi = Math.max(hi, r.threshold_db); }
+  if (!Number.isFinite(lo)) { lo = 30; hi = 80; }
+  const span = Math.max(10, hi - lo); lo = Math.floor((lo - span * 0.08) / 5) * 5; hi = Math.ceil((hi + span * 0.08) / 5) * 5;
+  const x = t => PAD.l + (t - tmin) / (tmax - tmin) * (w - PAD.l - PAD.r);
+  const y = v => PAD.t + (hi - v) / (hi - lo) * (h - PAD.t - PAD.b);
+  return {x, y, tmin, tmax, lo, hi, active};
+}
+
+function draw() {
+  const dpr = window.devicePixelRatio || 1, r = canvas.getBoundingClientRect();
+  canvas.width = Math.round(r.width * dpr); canvas.height = Math.round(r.height * dpr);
+  const g = canvas.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const w = r.width, h = r.height, sc = scales(w, h);
+  g.clearRect(0, 0, w, h);
+  g.font = "11px system-ui, sans-serif"; g.fillStyle = css("--muted"); g.strokeStyle = css("--line"); g.lineWidth = 1;
+  const step = (sc.hi - sc.lo) > 60 ? 20 : 10;
+  for (let v = Math.ceil(sc.lo / step) * step; v <= sc.hi; v += step) {
+    const yy = Math.round(sc.y(v)) + 0.5; g.beginPath(); g.moveTo(PAD.l, yy); g.lineTo(w - PAD.r, yy); g.stroke();
+    g.textAlign = "right"; g.textBaseline = "middle"; g.fillText(String(v), PAD.l - 6, yy);
+  }
+  const ticks = 6; g.textAlign = "center"; g.textBaseline = "top";
+  for (let i = 0; i <= ticks; i++) { const t = sc.tmin + (sc.tmax - sc.tmin) * i / ticks; g.fillText(timeStr(t, state.window <= 900), sc.x(t), h - PAD.b + 6); }
+  // events
+  for (const e of state.events) {
+    const t0 = e.start_second, t1 = e.ended_at ? Date.parse(e.ended_at) / 1000 : sc.tmax;
+    if (t1 < sc.tmin || t0 > sc.tmax) continue;
+    const x0 = Math.max(PAD.l, sc.x(t0)), x1 = Math.min(w - PAD.r, sc.x(t1));
+    g.fillStyle = css("--event"); g.fillRect(x0, PAD.t, Math.max(2, x1 - x0), h - PAD.t - PAD.b);
+    g.fillStyle = css("--event-edge"); g.fillRect(x0, PAD.t, 1.5, h - PAD.t - PAD.b);
+  }
+  // baseline / threshold
+  const det = state.status?.detection;
+  for (const rule of det?.rules || []) {
+    const s = sc.active.find(a => a.key === rule.metric); if (!s) continue;
+    g.setLineDash([5, 4]); g.lineWidth = 1; g.strokeStyle = css(s.color);
+    const b = det.baselines?.[rule.metric];
+    if (rule.kind === "relative" && b != null) { g.globalAlpha = .55; line(g, sc, b, w); }
+    if (rule.threshold_db != null) { g.globalAlpha = .9; line(g, sc, rule.threshold_db, w); g.textAlign = "left"; g.textBaseline = "bottom"; g.fillStyle = css(s.color); g.fillText("trigger " + fmt(rule.threshold_db), PAD.l + 4, sc.y(rule.threshold_db) - 2); }
+    g.globalAlpha = 1; g.setLineDash([]);
+  }
+  // series (breaks on gaps)
+  for (const s of sc.active) {
+    g.strokeStyle = css(s.color); g.lineWidth = s.key === "lafmax_db" ? 1.2 : 1.8; g.beginPath();
+    let pen = false, prevT = null;
+    for (const p of state.points) {
+      const v = p[s.key];
+      if (v == null || p.t < sc.tmin || (prevT != null && p.t - prevT > (p.bucket_s || 1) + 1)) { pen = false; }
+      if (v == null || p.t < sc.tmin) { prevT = p.t; continue; }
+      const X = sc.x(p.t + 0.5), Y = sc.y(v);
+      pen ? g.lineTo(X, Y) : g.moveTo(X, Y); pen = true; prevT = p.t;
+    }
+    g.stroke();
+  }
+  if (state.hover) { g.strokeStyle = css("--muted"); g.lineWidth = 1; g.beginPath(); g.moveTo(state.hover.x, PAD.t); g.lineTo(state.hover.x, h - PAD.b); g.stroke(); }
+  state._sc = sc;
+}
+
+function line(g, sc, v, w) { const yy = sc.y(v); g.beginPath(); g.moveTo(PAD.l, yy); g.lineTo(w - PAD.r, yy); g.stroke(); }
+
+canvas.addEventListener("mousemove", ev => {
+  const sc = state._sc; if (!sc || !state.points.length) return;
+  const r = canvas.getBoundingClientRect(), mx = ev.clientX - r.left;
+  const t = sc.tmin + (mx - PAD.l) / (r.width - PAD.l - PAD.r) * (sc.tmax - sc.tmin);
+  let best = null; for (const p of state.points) if (!best || Math.abs(p.t - t) < Math.abs(best.t - t)) best = p;
+  if (!best) return;
+  state.hover = {x: sc.x(best.t + 0.5)};
+  tip.replaceChildren(el("div", {style: "font-weight:600"}, timeStr(best.t, true)));
+  if (!best.ok && best.omit) tip.appendChild(el("div", {}, "omitted: " + best.omit.replaceAll("_", " ")));
+  for (const s of sc.active) if (best[s.key] != null) tip.appendChild(el("div", {}, `${s.label}: ${fmt(best[s.key])} ${s.unit}`));
+  if (best.untrusted_time) tip.appendChild(el("div", {}, "clock not trusted (kept local)"));
+  for (const f of best.flags || []) tip.appendChild(el("div", {className: "note"}, f.replaceAll("_", " ")));
+  tip.style.display = "block";
+  const left = Math.min(r.width - tip.offsetWidth - 4, state.hover.x + 10);
+  tip.style.left = left + "px"; tip.style.top = "10px";
+  draw();
+});
+canvas.addEventListener("mouseleave", () => { state.hover = null; tip.style.display = "none"; draw(); });
+window.addEventListener("resize", () => draw());
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { renderToggles(); draw(); });
+
+buildControls();
+getJSON("/api/status").then(s => { state.status = s; renderPills(); }).catch(() => renderPills(true));
+load().catch(() => renderPills(true));
+</script>
+</body>
+</html>

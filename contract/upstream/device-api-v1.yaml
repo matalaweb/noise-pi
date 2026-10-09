@@ -1,0 +1,1169 @@
+openapi: 3.1.0
+info:
+  title: Noise Monitor Device API
+  version: 1.0.0
+  summary: Contract between the Raspberry Pi capture agent and the Noise Monitor web application.
+  description: |
+    All routes live under `/api/v1/device`. Device and account identity are
+    inferred from the bearer credential; request bodies never carry account IDs.
+
+    ## Conventions
+    * HTTPS is required in production. Timestamps are RFC 3339; the server
+      returns UTC with millisecond precision (`2026-10-08T12:15:30.000Z`).
+    * Every JSON request body carries `schema_version` (currently `1`).
+      Unknown fields are rejected (`422 validation_failed`). Non-finite numbers
+      (including literals that overflow to infinity such as `1e400`) are rejected.
+    * Every response (success or error) includes `request_id` and
+      `server_received_at`, and an `X-Request-Id` header. A client may send its own
+      `X-Request-Id` (8–64 chars `[A-Za-z0-9._-]`); otherwise the server assigns a UUIDv7.
+    * Durations are integer milliseconds. dB values are JSON numbers stored
+      exactly as reported (IEEE double); clients should not round before sending.
+
+    ## Limits
+    * Request bodies: 1 MiB (1,048,576 bytes) after decompression. The
+      `Content-Length` check happens before the body is read; bodies sent with
+      `Content-Encoding: gzip` are inflated incrementally and rejected with 413
+      as soon as the decompressed size exceeds the limit.
+    * Measurement batches: at most 300 records.
+    * Rate limits (per device, fixed windows): measurement batches 60/minute
+      plus at most 10 per 10 seconds (burst 10); events 120/minute;
+      recording operations 60/minute; heartbeat + configuration fetch +
+      acknowledgments share 30/minute. Exceeding a limit returns
+      `429 rate_limited` with `Retry-After` (seconds).
+    * Capture timestamps whose interval ends more than 300 seconds after server
+      receipt are rejected with `422 clock_future_timestamp`.
+    * Measurements captured more than 30 days before receipt are rejected with
+      `422 outside_backfill_window` unless an owner has enabled an import window
+      for the device that covers them.
+
+    ## Retry behaviour (agents)
+    Every error body has `error.code`, `error.message`, `error.retry`, and
+    `error.permanent`:
+
+    | retry | Agent action |
+    | - | - |
+    | `backoff` | Network errors, timeouts, 429, 5xx. Retry with exponential backoff and full jitter (e.g. base 2 s, cap 5 min), honouring `Retry-After`, **reusing the same batch/event/recording identities**. |
+    | `after_clock_sync` | Do not retry until the clock is synchronized; then resubmit unchanged identities (data stays queued). |
+    | `after_configuration_refresh` | Refetch `GET /configuration`; resubmit only once provenance IDs are provisioned. |
+    | `after_correction` | Credential/ability problem; stop and alert the operator. |
+    | `never` | Permanent rejection. Quarantine the payload locally (never silently drop it) and do not retry automatically. |
+
+    `permanent: true` means the same request will never succeed without
+    intervention. Validation (422) and conflict (409) failures must never cause
+    a rapid retry loop.
+
+    ## Idempotency
+    * **Measurement batches** — identity is device + `batch_id`. Replaying the same
+      semantic payload returns the original result (`200`, `replayed: true`).
+      A different payload under the same `batch_id` returns `409 batch_conflict`.
+    * **Measurement rows** — identity is device + `channel` + `boot_id` + `sequence`,
+      across batches. Identical rows count as duplicates; a changed row makes
+      the whole batch fail with `409 measurement_conflict` (nothing is stored).
+      Compact replay receipts are kept after raw rows are deleted (≥ 90 days), so
+      old retries cannot resurrect purged readings.
+    * **Event revisions** — identity is device + `event_id` + `revision`. Identical
+      repeats succeed; changed content under an existing revision returns `409
+      event_revision_conflict`; older unseen revisions are stored for history but
+      never roll back the current projection; finalized events are terminal
+      (`409 event_terminal`).
+    * **Recordings** — identity is device + `recording_id`; a segment number is
+      unique within an event. Re-declaring identically returns current state
+      (and a valid upload attempt if still unverified); a different declaration
+      returns `409 recording_conflict`.
+
+    A successful (2xx) measurement response is returned only after the batch,
+    its rows, and derived-work markers are durably committed. Agents may delete
+    acknowledged local readings only after a 2xx response.
+
+    ## Canonical payload hash
+    Used to decide "identical" for batches, rows, and event revisions:
+    1. Parse and validate the JSON, then build the canonical value: UUIDs
+       lowercased; timestamps normalized to UTC `YYYY-MM-DDTHH:MM:SS.ffffffZ`;
+       numeric dB values as floats (so `78.4`, `78.40` and `78.4e0` are equal;
+       integers in metric fields become floats); a missing metric equals an
+       explicit `null`; `quality_flags` sorted and de-duplicated; `null_reasons`
+       keys sorted; `bands` sorted by `center_hz`.
+    2. Encode as JSON with object keys sorted by byte order (recursively), list
+       order preserved, no whitespace, unescaped `/` and Unicode, floats in
+       shortest round-trip form with a preserved `.0` fraction.
+    3. SHA-256 the UTF-8 bytes; lowercase hex.
+
+    Batch hash = canonical `{schema_version, batch_id, records}` where records
+    are the canonical rows sorted by (`channel`, `boot_id`, `sequence`).
+
+    Configuration hash = canonical `configuration` object **exactly as served**
+    (decoded from the response JSON, no type coercion), so an agent can verify
+    `sha256` by re-encoding what it received. Revisions published before
+    2026-10-09 hashed an in-memory form in which whole-number dB settings were
+    floats (`15.0`, served as `15`); agents may additionally accept the hash
+    with `detection.absolute.level_db` and `detection.baseline_relative.delta_db`
+    coerced to floats.
+    **`sent_at` is excluded** (transport metadata), so a retry with a new
+    send time is the same batch.
+
+    ## Recording upload (two stages)
+    1. `POST /events/{event_uuid}/recordings` declares an immutable segment and
+       returns a short-lived (15 min) presigned `PUT` for a server-generated
+       staging key. The device never chooses buckets, keys or ACLs.
+    2. `PUT` the exact bytes to `upload.url` with the returned `upload.headers`.
+    3. `POST /recordings/{recording_uuid}/complete` with that `attempt_id`
+       returns `202` (verification pending).
+    4. A worker independently streams the object once, hashing the same bytes
+       it copies to a server-owned final key, and checks length, SHA-256,
+       container, codec, sample rate, channels, bit depth and duration
+       (±50 ms). ETags are never treated as SHA-256.
+    5. Poll `GET /recordings/{recording_uuid}`. **Keep the local clip until
+       `status` is `verified`** (`retain_local_copy: false`). Upload success or a
+       `202` completion is not an acknowledgment.
+
+    Expired URL → `POST /recordings/{uuid}/upload-attempts` for a fresh staging
+    key. After `failed` verification the agent may explicitly create a new
+    attempt; the declaration (hash, size) is never rewritten.
+servers:
+  - url: https://{host}/api/v1/device
+    variables:
+      host:
+        default: noise-monitor.example.laravel.cloud
+  - url: http://localhost:8088/api/v1/device
+    description: Local Docker stack
+security:
+  - deviceToken: []
+tags:
+  - name: Measurements
+  - name: Events
+  - name: Recordings
+  - name: Configuration
+  - name: Health
+paths:
+  /measurements/batches:
+    post:
+      tags: [Measurements]
+      operationId: ingestMeasurementBatch
+      summary: Atomically ingest a measurement batch
+      description: |
+        Validates every record, then commits new rows, the batch receipt, and
+        dirty-bucket/outbox markers in one transaction. Requires ability
+        `measurements:write`. MVP records cover exactly 1,000 ms, aligned to a
+        UTC second boundary (start-inclusive, end-exclusive). Profiles,
+        deployments, calibrations and the configuration revision must already be
+        provisioned for this device.
+      parameters:
+        - $ref: '#/components/parameters/ContentEncoding'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MeasurementBatchRequest' }
+            examples:
+              normal: { externalValue: fixtures/measurement-batch.json }
+              flagged: { externalValue: fixtures/measurement-batch-flagged.json }
+      responses:
+        '201':
+          description: Batch committed (new).
+          headers: { X-Request-Id: { $ref: '#/components/headers/X-Request-Id' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MeasurementBatchResult' }
+              examples:
+                accepted: { externalValue: fixtures/responses/measurement-batch-201.json }
+        '200':
+          description: Exact replay of an already committed batch; original result returned with `replayed = true`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MeasurementBatchResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: '`batch_conflict` (batch_id reused with a different payload) or `measurement_conflict` (a sequence identity already stored with different values; whole batch rejected).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                conflict: { externalValue: fixtures/responses/measurement-conflict-409.json }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '422':
+          description: '`validation_failed`, `malformed_json`, `unsupported_schema_version`, `clock_future_timestamp`, `outside_backfill_window`, or `unknown_provenance`. Nothing is stored.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                validation: { externalValue: fixtures/responses/validation-422.json }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /events:
+    post:
+      tags: [Events]
+      operationId: submitEventRevision
+      summary: Submit an event revision (complete snapshot)
+      description: |
+        Requires ability `events:write`. Each revision must be a complete snapshot
+        of the event. An open event has `ended_at: null`; a finalized event must
+        have `ended_at`. The channel may not change between revisions.
+        If the agent stopped observing during the event (data loss, microphone
+        disconnect, process restart), it finalizes at the last observed second
+        and includes `incomplete_interval` (plus the cause flag, e.g.
+        `audio_dropout` or `microphone_disconnected`); `ended_at` is then where
+        observation stopped, not where the sound ended, and the UI shows it so.
+        Uncalibrated profiles must report null absolute SPL summary values and
+        may only trigger on `rms_dbfs`.
+      parameters:
+        - $ref: '#/components/parameters/ContentEncoding'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EventRevisionRequest' }
+            examples:
+              open: { externalValue: fixtures/event-open.json }
+              finalized: { externalValue: fixtures/event-finalized.json }
+      responses:
+        '201':
+          description: New revision stored and applied to the projection (`outcome = stored`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EventRevisionResult' }
+              examples:
+                stored: { externalValue: fixtures/responses/event-201.json }
+        '200':
+          description: '`outcome = duplicate` (identical repeat) or `stored_superseded` (older unseen revision kept for history; projection unchanged).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EventRevisionResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: '`event_revision_conflict` (changed content under an existing revision, or channel change) or `event_terminal` (event already finalized).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /events/{event_uuid}/recordings:
+    post:
+      tags: [Recordings]
+      operationId: declareRecording
+      summary: Declare a recording segment and obtain an upload attempt
+      description: |
+        Requires ability `recordings:write`. Initial formats: mono PCM WAV and
+        FLAC, at most 100 MiB (104,857,600 bytes) and 600,000 ms per segment;
+        longer events use sequential segments. `audio/x-wav` is normalized to
+        `audio/wav`.
+      parameters:
+        - name: event_uuid
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RecordingDeclaration' }
+            examples:
+              wav: { externalValue: fixtures/recording-declaration.json }
+      responses:
+        '201':
+          description: Declared; upload attempt issued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordingUploadResult' }
+              examples:
+                declared: { externalValue: fixtures/responses/recording-declaration-201.json }
+        '200':
+          description: Identical re-declaration. Includes a still-valid or fresh upload attempt unless the recording is already verified or purged.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordingUploadResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`recording_conflict` — different declaration for this recording_id, or the segment number is taken by another recording.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '422':
+          description: '`validation_failed`, `malformed_json`, or `recordings_disabled` (account policy).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /recordings/{recording_uuid}/upload-attempts:
+    post:
+      tags: [Recordings]
+      operationId: reissueUploadAttempt
+      summary: Issue a fresh upload attempt (new staging key)
+      description: |
+        Use after an upload URL expired or after a `failed` verification. Any
+        previously issued (not yet completed) attempt becomes `superseded`. No
+        request body is required.
+      parameters:
+        - $ref: '#/components/parameters/RecordingUuid'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '201':
+          description: New attempt issued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordingUploadResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`recording_already_verified` (no further uploads accepted) or `recording_conflict` (purged by retention).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /recordings/{recording_uuid}/complete:
+    post:
+      tags: [Recordings]
+      operationId: completeUpload
+      summary: Report completion of a specific upload attempt (stage one)
+      description: |
+        Records the exact attempt and queues independent verification.
+        Repeating the call is idempotent. A completion more than 24 hours
+        after the attempt expired is refused.
+      parameters:
+        - $ref: '#/components/parameters/RecordingUuid'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RecordingCompletion' }
+            examples:
+              complete: { externalValue: fixtures/recording-completion.json }
+      responses:
+        '202':
+          description: Completion recorded; verification pending (or in progress).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordingStatus' }
+              examples:
+                pending: { externalValue: fixtures/responses/recording-complete-202.json }
+        '200':
+          description: Recording already verified/purged, or this attempt already failed verification (see `failure_reason`; create a new attempt to retry).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordingStatus' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`upload_attempt_mismatch` — attempt does not belong to this recording, was superseded, or is too old.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /recordings/{recording_uuid}:
+    get:
+      tags: [Recordings]
+      operationId: getRecordingStatus
+      summary: Poll durable verification status
+      description: Delete the local clip only when `status` is `verified`.
+      parameters:
+        - $ref: '#/components/parameters/RecordingUuid'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Current status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordingStatus' }
+              examples:
+                verified: { externalValue: fixtures/responses/recording-status-verified-200.json }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /configuration:
+    get:
+      tags: [Configuration]
+      operationId: getConfiguration
+      summary: Fetch the complete desired configuration and revision
+      description: |
+        Requires ability `configuration:read`. Returns the latest complete,
+        immutable document (never a merge patch) with its SHA-256 (also sent as
+        a quoted `ETag`). Validate locally, apply at an interval boundary, then
+        acknowledge. A failed or offline update leaves the previous valid
+        configuration active. `provenance` lists the immutable profile,
+        placement and calibration records the agent must reference on readings.
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Desired configuration.
+          headers:
+            ETag:
+              description: Quoted configuration SHA-256.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigurationResult' }
+              examples:
+                current: { externalValue: fixtures/responses/configuration-200.json }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /calibrations/{calibration_uuid}/attachments/{attachment_uuid}:
+    get:
+      tags: [Configuration]
+      operationId: downloadCalibrationAttachment
+      summary: Download a calibration's microphone frequency-response file
+      description: |
+        Requires ability `configuration:read`. Serves only attachments with
+        purpose `frequency_response` that belong to one of this device's
+        calibration records (e.g. a miniDSP UMIK-1 serial-specific calibration
+        file). Paths are listed in `provenance.calibrations[].attachments[].download_path`.
+        The agent must verify the bytes against the listed `sha256` (also sent as
+        `X-Content-SHA256`). No other attachment purposes are ever served to devices.
+      parameters:
+        - name: calibration_uuid
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: attachment_uuid
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The exact stored bytes.
+          headers:
+            X-Content-SHA256:
+              description: Lowercase hex SHA-256 recorded when the file was stored.
+              schema: { type: string }
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /configuration/acknowledgments:
+    post:
+      tags: [Configuration]
+      operationId: acknowledgeConfiguration
+      summary: Report an applied or rejected configuration revision
+      parameters:
+        - $ref: '#/components/parameters/ContentEncoding'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConfigurationAcknowledgment' }
+            examples:
+              applied: { externalValue: fixtures/configuration-acknowledgment.json }
+      responses:
+        '201':
+          description: Acknowledgment recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigurationAcknowledgmentResult' }
+        '200':
+          description: Identical to the latest acknowledgment for this revision; not recorded again (`recorded = false`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigurationAcknowledgmentResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /heartbeat:
+    post:
+      tags: [Health]
+      operationId: sendHeartbeat
+      summary: Report health and capabilities
+      description: |
+        Requires ability `heartbeat:write`. Device-reported times are stored
+        separately from server receipt; the server never infers clock
+        correctness from request arrival. Default interval 60 s; offline is
+        shown after three missed intervals. Reported `capabilities` are used to
+        validate future configuration revisions.
+      parameters:
+        - $ref: '#/components/parameters/ContentEncoding'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Heartbeat' }
+            examples:
+              healthy: { externalValue: fixtures/heartbeat.json }
+      responses:
+        '200':
+          description: Heartbeat stored.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HeartbeatResult' }
+              examples:
+                ok: { externalValue: fixtures/responses/heartbeat-200.json }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+components:
+  securitySchemes:
+    deviceToken:
+      type: http
+      scheme: bearer
+      bearerFormat: nmd_<48 random characters>
+      description: |
+        Device credential shown once when issued by an owner. Only its SHA-256
+        digest is stored. Bound to exactly one device; valid only on
+        `/api/v1/device/*` (never on browser routes). Abilities:
+        `measurements:write`, `events:write`, `configuration:read`,
+        `recordings:write`, `heartbeat:write`. During rotation the previous
+        credential keeps working until its rotation window expires; revoked or
+        expired credentials fail immediately with `401 invalid_credentials`.
+  parameters:
+    ContentEncoding:
+      name: Content-Encoding
+      in: header
+      required: false
+      description: Optional `gzip`. The decompressed body must not exceed 1 MiB.
+      schema: { type: string, enum: [gzip, identity] }
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: Optional client correlation id (8–64 chars of `[A-Za-z0-9._-]`); echoed as `request_id`.
+      schema: { type: string, pattern: '^[A-Za-z0-9._-]{8,64}$' }
+    RecordingUuid:
+      name: recording_uuid
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  headers:
+    X-Request-Id:
+      description: The request_id of this response.
+      schema: { type: string }
+    Retry-After:
+      description: Seconds to wait before retrying.
+      schema: { type: integer }
+  responses:
+    Unauthorized:
+      description: '`invalid_credentials` — missing, invalid, expired, or revoked credential.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: '`forbidden_ability` — the credential lacks the required ability.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: '`not_found` — resource does not exist or belongs to another device.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    PayloadTooLarge:
+      description: '`payload_too_large` — body (or decompressed body) over 1 MiB, or more than 300 records. Split and resend.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unprocessable:
+      description: '`validation_failed`, `malformed_json`, `unsupported_schema_version`, `clock_future_timestamp`, or `unknown_provenance`.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: '`rate_limited`. Honour `Retry-After`.'
+      headers:
+        Retry-After: { $ref: '#/components/headers/Retry-After' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServiceUnavailable:
+      description: '`service_unavailable` — temporary storage or service failure (including a concurrent request still committing the same batch). Retry with backoff.'
+      headers:
+        Retry-After: { $ref: '#/components/headers/Retry-After' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    InternalError:
+      description: '`internal_error` — unexpected failure. Retry with backoff using the same identities.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Uuid: { type: string, format: uuid, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' }
+    Timestamp:
+      type: string
+      format: date-time
+      description: 'RFC 3339 with `Z` or numeric offset and up to 6 fractional digits.'
+      pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})$'
+    Channel: { type: string, pattern: '^[A-Za-z0-9._-]{1,32}$', examples: [mic-1] }
+    MetricName:
+      type: string
+      enum: [laeq_db, lafmax_db, lceq_db, lcpeak_db, low_frequency_leq_db, rms_dbfs]
+      description: |
+        laeq_db = LAeq (dBA, equivalent A-weighted over the interval);
+        lafmax_db = LAFmax (dBA, highest fast-weighted A level);
+        lceq_db = LCeq (dBC); lcpeak_db = LCpeak (dBC, max C-weighted instantaneous peak);
+        low_frequency_leq_db = unweighted band-limited Leq (dB re 20 µPa; band edges in the profile);
+        rms_dbfs = digital RMS relative to full scale (dBFS, never dBA).
+    QualityFlag:
+      type: string
+      enum: [clipping, audio_dropout, microphone_disconnected, unsynchronized_clock, below_noise_floor, invalid_calibration, processing_error, incomplete_interval]
+    Level:
+      type: [number, 'null']
+      minimum: -200
+      maximum: 250
+      description: Finite dB value or null. Absolute SPL metrics must be null for uncalibrated profiles.
+    Envelope:
+      type: object
+      required: [request_id, server_received_at]
+      properties:
+        request_id: { type: string }
+        server_received_at: { $ref: '#/components/schemas/Timestamp' }
+    Error:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [error]
+          properties:
+            error:
+              type: object
+              required: [code, message, retry, permanent]
+              properties:
+                code: { $ref: '#/components/schemas/ErrorCode' }
+                message: { type: string }
+                retry: { type: string, enum: [backoff, after_clock_sync, after_configuration_refresh, after_correction, never] }
+                permanent: { type: boolean }
+                details:
+                  type: object
+                  description: 'Optional. `errors` maps JSON paths (e.g. `records.7.captured_at`) to messages; conflicts list `{channel, boot_id, sequence, reason}` (at most 50, plus `conflict_count`).'
+    ErrorCode:
+      type: string
+      description: |
+        | code | HTTP | retry | permanent |
+        | - | - | - | - |
+        | invalid_credentials | 401 | after_correction | true |
+        | forbidden_ability | 403 | after_correction | true |
+        | not_found | 404 | never | true |
+        | batch_conflict | 409 | never | true |
+        | measurement_conflict | 409 | never | true |
+        | event_revision_conflict | 409 | never | true |
+        | event_terminal | 409 | never | true |
+        | recording_conflict | 409 | never | true |
+        | recording_already_verified | 409 | never | true |
+        | upload_attempt_mismatch | 409 | never | true |
+        | payload_too_large | 413 | never | true |
+        | malformed_json | 422 | never | true |
+        | validation_failed | 422 | never | true |
+        | unsupported_schema_version | 422 | never | true |
+        | clock_future_timestamp | 422 | after_clock_sync | true |
+        | outside_backfill_window | 422 | never | true |
+        | unknown_provenance | 422 | after_configuration_refresh | true |
+        | recordings_disabled | 422 | never | true |
+        | rate_limited | 429 | backoff | false |
+        | service_unavailable | 503 | backoff | false |
+        | internal_error | 500 | backoff | false |
+      enum:
+        - invalid_credentials
+        - forbidden_ability
+        - not_found
+        - batch_conflict
+        - measurement_conflict
+        - event_revision_conflict
+        - event_terminal
+        - recording_conflict
+        - recording_already_verified
+        - upload_attempt_mismatch
+        - payload_too_large
+        - malformed_json
+        - validation_failed
+        - unsupported_schema_version
+        - clock_future_timestamp
+        - outside_backfill_window
+        - unknown_provenance
+        - recordings_disabled
+        - rate_limited
+        - service_unavailable
+        - internal_error
+    Band:
+      type: object
+      additionalProperties: false
+      required: [center_hz, weighting]
+      properties:
+        center_hz:
+          type: number
+          exclusiveMinimum: 0
+          description: Nominal centre; must be defined by the profile (e.g. 20, 25, 31.5, 40, 50, 63, 80, 100, 125).
+        level_db: { type: [number, 'null'] }
+        weighting: { type: string, enum: [Z, A, C] }
+    MeasurementRecord:
+      type: object
+      additionalProperties: false
+      required: [boot_id, sequence, channel, captured_at, duration_ms, deployment_id, profile_id, configuration_revision]
+      description: |
+        At least one metric must be non-null, unless `quality_flags` explain the
+        absence. A metric that the profile supports but is null needs a
+        `null_reasons` entry (or a quality flag). Metrics unsupported by the
+        profile must be null. Unknown or unreliable values are null — never 0.
+      properties:
+        boot_id: { $ref: '#/components/schemas/Uuid' }
+        sequence: { type: integer, minimum: 0 }
+        channel: { $ref: '#/components/schemas/Channel' }
+        captured_at:
+          allOf: [{ $ref: '#/components/schemas/Timestamp' }]
+          description: Interval start; must be a whole UTC second.
+        duration_ms: { type: integer, const: 1000 }
+        deployment_id: { $ref: '#/components/schemas/Uuid' }
+        profile_id: { $ref: '#/components/schemas/Uuid' }
+        calibration_id:
+          type: [string, 'null']
+          format: uuid
+          description: Required for estimated/calibrated profiles (state must match); must be null/absent for uncalibrated profiles.
+        configuration_revision: { type: integer, minimum: 1 }
+        laeq_db: { $ref: '#/components/schemas/Level' }
+        lafmax_db: { $ref: '#/components/schemas/Level' }
+        lceq_db: { $ref: '#/components/schemas/Level' }
+        lcpeak_db: { $ref: '#/components/schemas/Level' }
+        low_frequency_leq_db: { $ref: '#/components/schemas/Level' }
+        rms_dbfs:
+          type: [number, 'null']
+          minimum: -200
+          maximum: 3.02
+        quality_flags:
+          type: array
+          items: { $ref: '#/components/schemas/QualityFlag' }
+          default: []
+        null_reasons:
+          type: object
+          description: Metric name → lowercase identifier (e.g. `unsupported`, `unreliable`). Only for null metrics.
+          propertyNames: { $ref: '#/components/schemas/MetricName' }
+          additionalProperties: { type: string, pattern: '^[a-z][a-z0-9_]{0,63}$' }
+        bands:
+          type: array
+          items: { $ref: '#/components/schemas/Band' }
+          default: []
+    MeasurementBatchRequest:
+      type: object
+      additionalProperties: false
+      required: [schema_version, batch_id, records]
+      properties:
+        schema_version: { type: integer, const: 1 }
+        batch_id: { $ref: '#/components/schemas/Uuid' }
+        sent_at:
+          type: [string, 'null']
+          format: date-time
+          description: Transport metadata; excluded from the batch hash.
+        records:
+          type: array
+          minItems: 1
+          maxItems: 300
+          items: { $ref: '#/components/schemas/MeasurementRecord' }
+    MeasurementBatchResult:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [batch_id, status, record_count, inserted_count, duplicate_count, accepted_interval, received_at, replayed]
+          properties:
+            batch_id: { $ref: '#/components/schemas/Uuid' }
+            status: { type: string, const: accepted }
+            record_count: { type: integer }
+            inserted_count: { type: integer }
+            duplicate_count: { type: integer }
+            accepted_interval:
+              type: object
+              description: Earliest start and latest end (exclusive) of the batch's records.
+              properties:
+                start: { $ref: '#/components/schemas/Timestamp' }
+                end: { $ref: '#/components/schemas/Timestamp' }
+            received_at:
+              allOf: [{ $ref: '#/components/schemas/Timestamp' }]
+              description: Original receipt time of the batch.
+            replayed: { type: boolean }
+            original_request_id:
+              type: [string, 'null']
+              description: Present on replays; request_id of the original commit.
+    EventRevisionRequest:
+      type: object
+      additionalProperties: false
+      required: [schema_version, event_id, revision, channel, deployment_id, profile_id, configuration_revision, detection_state, started_at, detection]
+      properties:
+        schema_version: { type: integer, const: 1 }
+        event_id: { $ref: '#/components/schemas/Uuid' }
+        revision: { type: integer, minimum: 1, description: "Monotonically increasing per event." }
+        sent_at: { type: [string, 'null'], format: date-time }
+        channel: { $ref: '#/components/schemas/Channel' }
+        deployment_id: { $ref: '#/components/schemas/Uuid' }
+        profile_id: { $ref: '#/components/schemas/Uuid' }
+        calibration_id: { type: [string, 'null'], format: uuid }
+        configuration_revision: { type: integer, minimum: 1 }
+        detection_state: { type: string, enum: [open, finalized] }
+        started_at: { $ref: '#/components/schemas/Timestamp' }
+        ended_at: { type: [string, 'null'], format: date-time, description: 'null while open; required when finalized; must not precede started_at.' }
+        detection:
+          type: object
+          additionalProperties: false
+          required: [rule_version, trigger_metric, trigger_kind]
+          properties:
+            rule_version: { type: string, maxLength: 64 }
+            trigger_metric: { $ref: '#/components/schemas/MetricName' }
+            trigger_kind: { type: string, enum: [absolute, baseline_relative] }
+            threshold_db: { type: [number, 'null'] }
+            trigger_value_db: { type: [number, 'null'] }
+            baseline_db: { type: [number, 'null'], description: "Agent-reported baseline at trigger time." }
+            baseline_method: { type: [string, 'null'], maxLength: 255 }
+        summary:
+          type: object
+          additionalProperties: false
+          description: Agent-reported summary; displayed separately from server-derived summaries.
+          properties:
+            laeq_db: { type: [number, 'null'] }
+            lafmax_db: { type: [number, 'null'] }
+            lceq_db: { type: [number, 'null'] }
+            lcpeak_db: { type: [number, 'null'] }
+            low_frequency_leq_db: { type: [number, 'null'] }
+            rms_dbfs: { type: [number, 'null'] }
+            duration_ms: { type: [integer, 'null'], minimum: 0 }
+        recording:
+          type: object
+          additionalProperties: false
+          properties:
+            expected: { type: boolean, default: false }
+            started_at: { type: [string, 'null'], format: date-time }
+            ended_at: { type: [string, 'null'], format: date-time }
+            expected_segments: { type: [integer, 'null'], minimum: 1 }
+        quality_flags:
+          type: array
+          items: { $ref: '#/components/schemas/QualityFlag' }
+    EventRevisionResult:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [event_id, revision, outcome, applied_to_projection, current_revision, detection_state, completeness_state]
+          properties:
+            event_id: { $ref: '#/components/schemas/Uuid' }
+            revision: { type: integer }
+            outcome: { type: string, enum: [stored, duplicate, stored_superseded] }
+            applied_to_projection: { type: boolean }
+            current_revision: { type: integer }
+            detection_state: { type: string, enum: [open, finalized] }
+            completeness_state: { type: string, enum: [pending, complete, partial, unavailable] }
+            recording_state: { type: [string, 'null'], enum: [pending, uploaded, verifying, verified, failed, missing, purged, null] }
+            first_received_at: { $ref: '#/components/schemas/Timestamp' }
+    RecordingDeclaration:
+      type: object
+      additionalProperties: false
+      required: [schema_version, recording_id, segment_number, capture_started_at, duration_ms, mime_type, codec, sample_rate_hz, channel_count, byte_size, sha256]
+      properties:
+        schema_version: { type: integer, const: 1 }
+        recording_id: { $ref: '#/components/schemas/Uuid' }
+        segment_number: { type: integer, minimum: 1, maximum: 1000 }
+        capture_started_at: { $ref: '#/components/schemas/Timestamp' }
+        duration_ms: { type: integer, minimum: 1, maximum: 600000 }
+        mime_type: { type: string, enum: [audio/wav, audio/x-wav, audio/flac] }
+        codec: { type: string, enum: [pcm_s16le, pcm_s24le, pcm_s32le, pcm_f32le, flac], description: '`flac` if and only if mime_type is audio/flac.' }
+        sample_rate_hz: { type: integer, minimum: 8000, maximum: 384000 }
+        channel_count: { type: integer, const: 1, description: "Initial formats are mono." }
+        bit_depth: { type: [integer, 'null'], enum: [16, 24, 32, null] }
+        byte_size: { type: integer, minimum: 44, maximum: 104857600 }
+        sha256: { type: string, pattern: '^[0-9a-f]{64}$', description: "Lowercase hex SHA-256 of the exact uploaded bytes." }
+    UploadAttempt:
+      type: object
+      required: [attempt_id, method, url, headers, expires_at]
+      properties:
+        attempt_id: { $ref: '#/components/schemas/Uuid' }
+        method: { type: string, const: PUT }
+        url: { type: string, format: uri, description: "Presigned URL for a server-generated staging key. Treat as a secret; never log it." }
+        headers: { type: object, additionalProperties: { type: string }, description: "Headers that must be sent with the PUT." }
+        expires_at: { $ref: '#/components/schemas/Timestamp' }
+    RecordingUploadResult:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [recording_id, event_id, segment_number, status, verified]
+          properties:
+            recording_id: { $ref: '#/components/schemas/Uuid' }
+            event_id: { $ref: '#/components/schemas/Uuid' }
+            segment_number: { type: integer }
+            status: { $ref: '#/components/schemas/RecordingStatusValue' }
+            verified: { type: boolean }
+            upload:
+              allOf: [{ $ref: '#/components/schemas/UploadAttempt' }]
+              description: Omitted when the recording is already verified or purged.
+    RecordingStatusValue:
+      type: string
+      enum: [pending, uploaded, verifying, verified, failed, missing, purged]
+    RecordingCompletion:
+      type: object
+      additionalProperties: false
+      required: [schema_version, attempt_id]
+      properties:
+        schema_version: { type: integer, const: 1 }
+        attempt_id: { $ref: '#/components/schemas/Uuid' }
+    RecordingStatus:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [recording_id, event_id, segment_number, status, verified, retain_local_copy]
+          properties:
+            recording_id: { $ref: '#/components/schemas/Uuid' }
+            event_id: { $ref: '#/components/schemas/Uuid' }
+            segment_number: { type: integer }
+            status: { $ref: '#/components/schemas/RecordingStatusValue' }
+            verified: { type: boolean }
+            verified_sha256: { type: [string, 'null'] }
+            verified_at: { type: [string, 'null'], format: date-time }
+            failure_reason:
+              type: [string, 'null']
+              description: e.g. size_mismatch, sha256_mismatch, unreadable_media, format_mismatch, codec_mismatch, sample_rate_mismatch, channel_count_mismatch, bit_depth_mismatch, duration_mismatch, object_missing.
+            retain_local_copy: { type: boolean, description: "true until the recording is verified (or purged)." }
+            latest_attempt:
+              type: [object, 'null']
+              properties:
+                attempt_id: { $ref: '#/components/schemas/Uuid' }
+                state: { type: string, enum: [issued, completed, verifying, verified, failed, superseded, expired, cleaned] }
+                expires_at: { $ref: '#/components/schemas/Timestamp' }
+                failure_reason: { type: [string, 'null'] }
+    ConfigurationDocument:
+      type: object
+      description: Complete immutable configuration; `sha256` is the canonical hash of this object.
+      required: [schema_version, device_id, revision, reporting_interval_seconds, heartbeat_interval_seconds, measurement_interval_ms, channels, recording, detection, local_retention]
+      properties:
+        schema_version: { type: integer, const: 1 }
+        device_id: { $ref: '#/components/schemas/Uuid' }
+        revision: { type: integer }
+        reporting_interval_seconds: { type: integer, minimum: 5, maximum: 300, default: 30 }
+        heartbeat_interval_seconds: { type: integer, minimum: 10, maximum: 3600, default: 60 }
+        measurement_interval_ms: { type: integer, const: 1000 }
+        channels:
+          type: array
+          items:
+            type: object
+            properties:
+              channel: { $ref: '#/components/schemas/Channel' }
+              enabled: { type: boolean }
+              metrics: { type: array, items: { $ref: '#/components/schemas/MetricName' } }
+              bands_enabled: { type: boolean }
+              measurement_profile_id: { $ref: '#/components/schemas/Uuid' }
+              deployment_id: { $ref: '#/components/schemas/Uuid' }
+              calibration_id: { type: [string, 'null'], format: uuid }
+              calibration_state: { type: string, enum: [uncalibrated, estimated, calibrated] }
+        recording:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            format: { type: string, enum: [audio/wav, audio/flac] }
+            pre_roll_seconds: { type: integer, default: 10 }
+            post_roll_seconds: { type: integer, default: 30 }
+            max_segment_duration_seconds: { type: integer, maximum: 600 }
+        detection:
+          type: object
+          description: Owner-chosen thresholds; not legal or universal disturbance limits.
+          properties:
+            rule_version: { type: string }
+            absolute:
+              type: object
+              properties:
+                enabled: { type: boolean }
+                metric: { $ref: '#/components/schemas/MetricName' }
+                level_db: { type: [number, 'null'] }
+            baseline_relative:
+              type: object
+              properties:
+                enabled: { type: boolean }
+                metric: { $ref: '#/components/schemas/MetricName' }
+                delta_db: { type: [number, 'null'] }
+                baseline_window_seconds: { type: integer }
+            min_event_duration_ms: { type: integer }
+            merge_gap_ms: { type: integer }
+            observation_period_until: { type: [string, 'null'], format: date-time }
+        local_retention:
+          type: object
+          properties:
+            measurement_days: { type: integer }
+            audio_days: { type: integer }
+            max_disk_usage_percent: { type: integer }
+    ConfigurationResult:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [revision, sha256, issued_at, configuration, provenance]
+          properties:
+            revision: { type: integer }
+            sha256:
+              type: string
+              pattern: '^[0-9a-f]{64}$'
+              description: Canonical hash of `configuration` exactly as served (see "Canonical payload hash").
+            issued_at: { $ref: '#/components/schemas/Timestamp' }
+            applied_revision: { type: [integer, 'null'] }
+            configuration: { $ref: '#/components/schemas/ConfigurationDocument' }
+            provenance:
+              type: object
+              properties:
+                measurement_profiles: { type: array, items: { $ref: '#/components/schemas/ProvenanceProfile' } }
+                deployments: { type: array, items: { $ref: '#/components/schemas/ProvenanceDeployment' } }
+                calibrations: { type: array, items: { $ref: '#/components/schemas/ProvenanceCalibration' } }
+    ProvenanceProfile:
+      type: object
+      required: [id, channel, revision, calibration_state, supported_metrics, sample_rate_hz, content_hash]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        channel: { $ref: '#/components/schemas/Channel' }
+        revision: { type: integer }
+        calibration_state: { type: string, enum: [uncalibrated, estimated, calibrated] }
+        microphone_model: { type: string }
+        microphone_serial: { type: [string, 'null'], description: "Agents may refuse to measure with a microphone whose serial differs." }
+        audio_interface: { type: [string, 'null'] }
+        gain_description: { type: [string, 'null'] }
+        calibration_application_method: { type: [string, 'null'] }
+        supported_metrics: { type: array, items: { $ref: '#/components/schemas/MetricName' } }
+        sample_rate_hz: { type: integer }
+        gain_db: { type: [number, 'null'] }
+        low_frequency_band_hz: { type: [array, 'null'], items: { type: number }, minItems: 2, maxItems: 2 }
+        band_definitions: { type: [object, 'null'] }
+        content_hash: { type: string }
+    ProvenanceDeployment:
+      type: object
+      required: [id, revision, effective_at, content_hash]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        revision: { type: integer }
+        effective_at: { $ref: '#/components/schemas/Timestamp' }
+        content_hash: { type: string }
+    ProvenanceCalibration:
+      type: object
+      required: [id, channel, revision, calibration_state, content_hash]
+      description: |
+        Owner-documented calibration chain. `sensitivity_dbfs_at_94db` is the RMS
+        dBFS reading the documented chain produces for 94 dB SPL at the reference
+        frequency; agents derive their absolute scale from it. No accuracy or
+        uncertainty value is implied.
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        channel: { $ref: '#/components/schemas/Channel' }
+        revision: { type: integer }
+        calibration_state: { type: string, enum: [estimated, calibrated] }
+        reference_method: { type: string }
+        reference_device: { type: [string, 'null'] }
+        reference_level_db: { type: [number, 'null'] }
+        reference_frequency_hz: { type: [number, 'null'] }
+        sensitivity_mv_per_pa: { type: [number, 'null'] }
+        sensitivity_dbfs_at_94db: { type: [number, 'null'] }
+        gain_configuration: { type: [string, 'null'] }
+        application_method: { type: [string, 'null'] }
+        correction_metadata: { type: [object, array, 'null'] }
+        performed_at: { type: [string, 'null'], format: date-time }
+        attachments:
+          type: array
+          items: { $ref: '#/components/schemas/ProvenanceAttachment' }
+        content_hash: { type: string }
+    ProvenanceAttachment:
+      type: object
+      required: [id, purpose, filename, byte_size, sha256, download_path]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        purpose: { type: string, enum: [frequency_response] }
+        filename: { type: string }
+        byte_size: { type: integer }
+        sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+        download_path: { type: string, description: "Path on the API origin; authenticate with the device token." }
+    ConfigurationAcknowledgment:
+      type: object
+      additionalProperties: false
+      required: [schema_version, revision, status]
+      properties:
+        schema_version: { type: integer, const: 1 }
+        revision: { type: integer, minimum: 1 }
+        status: { type: string, enum: [applied, rejected] }
+        reason: { type: [string, 'null'], maxLength: 2000, description: "Required when rejected." }
+        applied_at: { type: [string, 'null'], format: date-time, description: "Device-reported application time." }
+        content_hash: { type: [string, 'null'], pattern: '^[0-9a-f]{64}$', description: "If sent, must equal the revision's sha256." }
+    ConfigurationAcknowledgmentResult:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            revision: { type: integer }
+            status: { type: string, enum: [applied, rejected] }
+            recorded: { type: boolean }
+            desired_config_revision: { type: [integer, 'null'] }
+            applied_config_revision: { type: [integer, 'null'] }
+    Heartbeat:
+      type: object
+      additionalProperties: false
+      required: [schema_version, agent_version, capabilities, microphone_state, clock]
+      properties:
+        schema_version: { type: integer, const: 1 }
+        sent_at: { type: [string, 'null'], format: date-time }
+        agent_version: { type: string, maxLength: 64 }
+        boot_id:
+          type: [string, 'null']
+          format: uuid
+          description: Current acquisition session; null (or omitted) while the agent has none, e.g. before the microphone is connected.
+        uptime_seconds: { type: [integer, 'null'], minimum: 0 }
+        capabilities:
+          type: object
+          required: [channels, metrics]
+          properties:
+            channels: { type: array, items: { type: string, maxLength: 32 } }
+            metrics: { type: array, items: { $ref: '#/components/schemas/MetricName' } }
+            third_octave_bands: { type: [boolean, 'null'] }
+            recording_formats: { type: [array, 'null'], items: { type: string, enum: [audio/wav, audio/flac] } }
+            max_sample_rate_hz: { type: [integer, 'null'] }
+        microphone_state: { type: string, enum: [ok, disconnected, error, unknown] }
+        free_disk_bytes: { type: [integer, 'null'], minimum: 0 }
+        total_disk_bytes: { type: [integer, 'null'], minimum: 0 }
+        queued_measurement_count: { type: [integer, 'null'], minimum: 0 }
+        pending_audio_bytes: { type: [integer, 'null'], minimum: 0 }
+        pending_audio_count: { type: [integer, 'null'], minimum: 0 }
+        oldest_pending_capture_at: { type: [string, 'null'], format: date-time }
+        desired_config_revision: { type: [integer, 'null'], minimum: 1 }
+        applied_config_revision: { type: [integer, 'null'], minimum: 1 }
+        clock:
+          type: object
+          additionalProperties: false
+          required: [sync_state]
+          properties:
+            sync_state: { type: string, enum: [synchronized, unsynchronized, unknown] }
+            offset_ms: { type: [integer, 'null'], description: "Estimated offset if known." }
+            source: { type: [string, 'null'], maxLength: 64 }
+        recent_dropped_intervals: { type: [integer, 'null'], minimum: 0 }
+        last_capture_error: { type: [string, 'null'], maxLength: 2000 }
+    HeartbeatResult:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            desired_config_revision: { type: [integer, 'null'] }
+            applied_config_revision: { type: [integer, 'null'] }
+            configuration_pending: { type: boolean, description: "true when the desired revision differs from the reported applied revision; fetch configuration." }
+            heartbeat_interval_seconds: { type: integer }
+            reporting_interval_seconds: { type: integer }

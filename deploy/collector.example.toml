@@ -1,0 +1,73 @@
+# Local, owner-controlled settings. The server cannot change anything in this file.
+# Secrets do NOT belong here: the device token lives in credentials_file (mode 0600).
+
+[paths]
+state_dir = "/var/lib/noise-collector"
+credentials_file = "/etc/noise-collector/credentials.toml"
+# Absolute scales for server calibration records (see docs/calibration.md). Optional.
+calibrations_file = "/etc/noise-collector/calibrations.toml"
+
+[server]
+base_url = "https://noise.example.com"
+# Presigned upload hosts the collector may PUT audio to (glob patterns). Empty = audio never uploads.
+trusted_storage_hosts = ["*.r2.cloudflarestorage.com"]
+connect_timeout_s = 10
+response_timeout_s = 30
+max_batches_per_minute = 50
+
+[microphone]
+# miniDSP UMIK-1 preset (USB 2752:0007). Its USB serial is a placeholder on every unit, so leave
+# usb_serial empty and pin the physical port with usb_path (shown by `noise-collector umik`);
+# without usb_path the collector uses the UMIK-1 only if exactly one is connected.
+model = "umik-1"
+usb_path = ""               # e.g. "1-1.2"
+usb_serial = ""
+# The calibration record in the web app carries the serial-specific file(s); if both the 0deg and
+# the 90deg file are attached, choose the one matching how the microphone is mounted.
+calibration_orientation = "90deg"   # "0deg" = pointing at the source, "90deg" = pointing up
+# Other microphones: set usb_vendor_id / usb_product_id plus usb_serial or usb_path, and either
+# expected_gain_controls (from `noise-collector devices`) or gain_reference_check.
+
+[capture]
+# UMIK-1: S24_3LE at 48 kHz; most units expose 2 identical channels, some are mono. Use the native
+# channel count reported by `noise-collector umik`; channel 0 is analysed (channels are compared,
+# never averaged). The sample rate comes from the web-app profile (48000 for the UMIK-1).
+container = "int24"
+valid_bits = 24
+channels = 2
+analysis_channel = 0
+latency = "high"            # robust over minimal latency
+buffer_seconds = 2.0        # capture -> DSP buffer; overflow invalidates intervals, never silently
+reconnect_delays_s = [1, 2, 5, 10, 30]
+
+[channel]
+id = "mic-1"                # the channel name used in the web app's configuration
+
+[recording]
+locally_enabled = true      # remote configuration can never re-enable recording when false
+
+[capabilities]
+low_frequency_validated = false   # enables low-frequency trigger rules after field validation
+
+[timing]
+require_clock_sync = true
+step_tolerance_ms = 50
+max_alignment_error_ms = 100
+
+[storage]
+# 0 = derive from the volume size: reserve max(1 GiB, 10%), metadata min(4 GiB, 20%), audio = rest
+audio_quota_bytes = 0
+measurement_quota_bytes = 0
+reserve_bytes = 0
+warning_fraction = 0.8
+acknowledged_retention_days = 7
+verified_audio_retention_hours = 24
+
+[logging]
+level = "INFO"
+
+[dashboard]
+enabled = false             # local live view of levels/events (never audio)
+bind = "127.0.0.1"          # use an SSH tunnel; LAN binding requires access_token_file
+port = 8765
+# access_token_file = "/etc/noise-collector/dashboard-token"

@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "sent_at": "2026-10-08T12:16:00.000Z",
+  "agent_version": "noise-agent 0.1.0",
+  "boot_id": "{{BOOT_ID}}",
+  "uptime_seconds": 86400,
+  "capabilities": {
+    "channels": ["mic-1"],
+    "metrics": ["laeq_db", "lafmax_db", "lceq_db", "lcpeak_db", "low_frequency_leq_db", "rms_dbfs"],
+    "third_octave_bands": true,
+    "recording_formats": ["audio/wav", "audio/flac"],
+    "max_sample_rate_hz": 48000
+  },
+  "microphone_state": "ok",
+  "free_disk_bytes": 21474836480,
+  "total_disk_bytes": 31914983424,
+  "queued_measurement_count": 30,
+  "pending_audio_bytes": 4992044,
+  "pending_audio_count": 1,
+  "oldest_pending_capture_at": "2026-10-08T12:15:30.000Z",
+  "desired_config_revision": "{{CONFIGURATION_REVISION}}",
+  "applied_config_revision": "{{CONFIGURATION_REVISION}}",
+  "clock": {
+    "sync_state": "synchronized",
+    "offset_ms": 3,
+    "source": "chrony"
+  },
+  "recent_dropped_intervals": 0,
+  "last_capture_error": null
+}

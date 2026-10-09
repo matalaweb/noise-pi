@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "event_id": "7f1c2b9e-3a4d-4e5f-8a6b-9c0d1e2f3a4b",
+  "revision": 1,
+  "sent_at": "2026-10-08T12:15:36.000Z",
+  "channel": "mic-1",
+  "deployment_id": "{{DEPLOYMENT_ID}}",
+  "profile_id": "{{PROFILE_ID}}",
+  "calibration_id": "{{CALIBRATION_ID}}",
+  "configuration_revision": "{{CONFIGURATION_REVISION}}",
+  "detection_state": "open",
+  "started_at": "2026-10-08T12:15:30.000Z",
+  "ended_at": null,
+  "detection": {
+    "rule_version": "owner-rules-v1",
+    "trigger_metric": "lafmax_db",
+    "trigger_kind": "baseline_relative",
+    "threshold_db": 15.0,
+    "trigger_value_db": 86.2,
+    "baseline_db": 51.8,
+    "baseline_method": "rolling 5-minute median LAeq"
+  },
+  "summary": {
+    "laeq_db": null,
+    "lafmax_db": 86.2,
+    "lceq_db": null,
+    "lcpeak_db": null,
+    "low_frequency_leq_db": null,
+    "rms_dbfs": null,
+    "duration_ms": null
+  },
+  "recording": {
+    "expected": true,
+    "started_at": "2026-10-08T12:15:20.000Z",
+    "ended_at": null,
+    "expected_segments": null
+  },
+  "quality_flags": []
+}

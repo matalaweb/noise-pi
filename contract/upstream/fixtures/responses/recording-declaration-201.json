@@ -1,0 +1,16 @@
+{
+  "request_id": "019a0f3d-1b2c-7e6f-9a7b-8c9d0e1f2a3b",
+  "server_received_at": "2026-10-08T12:16:30.000Z",
+  "recording_id": "c0ffee00-1d2e-4f3a-9b8c-7d6e5f4a3b2c",
+  "event_id": "7f1c2b9e-3a4d-4e5f-8a6b-9c0d1e2f3a4b",
+  "segment_number": 1,
+  "status": "pending",
+  "verified": false,
+  "upload": {
+    "attempt_id": "019a0f3d-1b2d-7000-8000-000000000001",
+    "method": "PUT",
+    "url": "https://storage.example/bucket/staging/<account>/<device>/c0ffee00-1d2e-4f3a-9b8c-7d6e5f4a3b2c/019a0f3d-1b2d-7000-8000-000000000001.wav?X-Amz-Signature=<redacted>",
+    "headers": {},
+    "expires_at": "2026-10-08T12:31:30.000Z"
+  }
+}

@@ -1,0 +1,26 @@
+# Input to `noise-collector provision`. Identities come from the Laravel application;
+# provision checks that the server-issued configuration matches them.
+
+[paths]
+state_dir = "/var/lib/noise-collector"
+credentials_file = "/etc/noise-collector/credentials.toml"
+
+[server]
+base_url = "https://noise.example.com"
+trusted_storage_hosts = ["*.r2.cloudflarestorage.com"]
+
+[microphone]
+model = "umik-1"
+usb_path = "REPLACE-from-noise-collector-umik"   # e.g. "1-1.2"
+calibration_orientation = "90deg"
+
+[capture]
+channels = 2                # native channel count from `noise-collector umik` (some UMIK-1 units are mono: 1)
+
+[channel]
+id = "mic-1"
+
+[expected]
+deployment_id = "REPLACE"
+profile_id = "REPLACE"
+calibration_id = "REPLACE"   # omit for an uncalibrated profile

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "recording_id": "c0ffee00-1d2e-4f3a-9b8c-7d6e5f4a3b2c",
+  "segment_number": 1,
+  "capture_started_at": "2026-10-08T12:15:20.000Z",
+  "duration_ms": 52000,
+  "mime_type": "audio/wav",
+  "codec": "pcm_s16le",
+  "sample_rate_hz": 48000,
+  "channel_count": 1,
+  "bit_depth": 16,
+  "byte_size": 4992044,
+  "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+}

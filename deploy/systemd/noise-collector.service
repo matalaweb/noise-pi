@@ -1,0 +1,56 @@
+[Unit]
+Description=Noise monitoring collector (capture + delivery)
+Documentation=file:///opt/noise-collector/docs/operations.md
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target sound.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=noise-collector
+Group=noise-collector
+SupplementaryGroups=audio
+Environment=NOISE_COLLECTOR_CONFIG=/etc/noise-collector/collector.toml
+Environment=NOISE_COLLECTOR_RUN_DIR=/run/noise-collector
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/noise-collector/venv/bin/noise-collector run
+Restart=always
+RestartSec=5
+# Backoff: at most 5 restarts per 10 minutes before systemd gives up and the unit shows failed.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+# Fed only while acquisition reports progressing capture/storage work.
+WatchdogSec=60
+# Children get 30 s to persist metadata, finalize interrupted recordings and release the microphone.
+TimeoutStopSec=45
+KillMode=mixed
+
+StateDirectory=noise-collector
+StateDirectoryMode=0750
+RuntimeDirectory=noise-collector
+RuntimeDirectoryMode=0750
+LogsDirectory=noise-collector
+
+# Hardening: no root, no new privileges, only ALSA devices, only the state directory writable.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/noise-collector
+ProtectHome=yes
+PrivateTmp=yes
+DevicePolicy=closed
+DeviceAllow=char-alsa rw
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# Not ProtectClock: its seccomp filter also blocks the read-only adjtimex() used to verify NTP sync.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=no
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+MemoryMax=768M
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

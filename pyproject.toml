@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "noise-collector"
+version = "0.1.0"
+description = "Raspberry Pi noise-monitoring collector: capture, DSP, event evidence, durable delivery"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "sounddevice>=0.4.6",
+    "soundfile>=0.12",
+    "httpx>=0.27",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "respx>=0.21",
+    "pip-tools>=7.4",
+    "pyyaml>=6",
+    "jsonschema>=4.20",
+]
+
+[project.scripts]
+noise-collector = "noise_collector.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+noise_collector = ["dsp/coefficients/*.json", "store/migrations/*.sql", "dashboard/*.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "slow: long-running replay or fault-injection tests",
+    "hardware: requires a Raspberry Pi with the configured microphone (skipped otherwise)",
+    "laravel: requires a running Laravel contract server (NOISE_LARAVEL_URL)",
+]
