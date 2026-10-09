@@ -20,7 +20,8 @@ info:
       exactly as reported (IEEE double); clients should not round before sending.
 
     ## Limits
-    * Request bodies: 1 MiB (1,048,576 bytes) after decompression. The
+    * Request bodies: 1 MiB (1,048,576 bytes) after decompression (2 MiB for
+      `POST /provenance`, which carries calibration files inline). The
       `Content-Length` check happens before the body is read; bodies sent with
       `Content-Encoding: gzip` are inflated incrementally and rejected with 413
       as soon as the decompressed size exceeds the limit.
@@ -28,7 +29,7 @@ info:
     * Rate limits (per device, fixed windows): measurement batches 60/minute
       plus at most 10 per 10 seconds (burst 10); events 120/minute;
       recording operations 60/minute; heartbeat + configuration fetch +
-      acknowledgments share 30/minute. Exceeding a limit returns
+      acknowledgments + provenance registration share 30/minute. Exceeding a limit returns
       `429 rate_limited` with `Retry-After` (seconds).
     * Capture timestamps whose interval ends more than 300 seconds after server
       receipt are rejected with `422 clock_future_timestamp`.
@@ -44,8 +45,8 @@ info:
     | - | - |
     | `backoff` | Network errors, timeouts, 429, 5xx. Retry with exponential backoff and full jitter (e.g. base 2 s, cap 5 min), honouring `Retry-After`, **reusing the same batch/event/recording identities**. |
     | `after_clock_sync` | Do not retry until the clock is synchronized; then resubmit unchanged identities (data stays queued). |
-    | `after_configuration_refresh` | Refetch `GET /configuration`; resubmit only once provenance IDs are provisioned. |
-    | `after_correction` | Credential/ability problem; stop and alert the operator. |
+    | `after_configuration_refresh` | `unknown_provenance`: re-register the measurement chain (`POST /provenance`) and refetch `GET /configuration`; then resubmit with unchanged identities. |
+    | `after_correction` | Credential/ability problem, or `provenance_conflict` (an immutable provenance id reused with different content); stop and alert the operator. |
     | `never` | Permanent rejection. Quarantine the payload locally (never silently drop it) and do not retry automatically. |
 
     `permanent: true` means the same request will never succeed without
@@ -66,6 +67,10 @@ info:
       event_revision_conflict`; older unseen revisions are stored for history but
       never roll back the current projection; finalized events are terminal
       (`409 event_terminal`).
+    * **Provenance records** — identity is the device-generated `id` (globally
+      unique). Re-registering identical content is a no-op (`status: existing`);
+      different content under a known id, or an id registered by another device,
+      returns `409 provenance_conflict` and nothing is stored.
     * **Recordings** — identity is device + `recording_id`; a segment number is
       unique within an event. Re-declaring identically returns current state
       (and a valid upload attempt if still unverified); a different declaration
@@ -89,7 +94,9 @@ info:
     3. SHA-256 the UTF-8 bytes; lowercase hex.
 
     Batch hash = canonical `{schema_version, batch_id, records}` where records
-    are the canonical rows sorted by (`channel`, `boot_id`, `sequence`).
+    are the canonical rows sorted by (`channel`, `boot_id`, `sequence`). The
+    ignored `deployment_id` is part of a row or event revision hash only when
+    the agent sends it (older agents), so their retries keep matching.
 
     Configuration hash = canonical `configuration` object **exactly as served**
     (decoded from the response JSON, no type coercion), so an agent can verify
@@ -129,12 +136,68 @@ servers:
 security:
   - deviceToken: []
 tags:
+  - name: Provenance
   - name: Measurements
   - name: Events
   - name: Recordings
   - name: Configuration
   - name: Health
 paths:
+  /provenance:
+    post:
+      tags: [Provenance]
+      operationId: registerProvenance
+      summary: Register the device's measurement profiles and calibrations
+      description: |
+        Requires ability `measurements:write`. The device is the source of truth
+        for its measurement chain. Records carry device-generated UUIDs, are
+        immutable, and are idempotent by content hash. The server hashes each
+        record with the canonical encoding, excluding `id` and including each
+        attachment's `purpose`, `filename` and `sha256` (not the bytes).
+
+        * Unknown `id` → stored (next revision for the channel), `status: created`.
+        * Known `id` for this device with identical content → `status: existing`.
+        * Known `id` with different content, or an `id` registered by another
+          device → `409 provenance_conflict`; nothing of the request is stored.
+
+        The whole request is one transaction. Register before sending readings or
+        events that reference a record, and again after `unknown_provenance`.
+        Placements are not registered by devices; owners record them and the
+        server assigns them by capture time. Request bodies may be up to 2 MiB.
+      parameters:
+        - $ref: '#/components/parameters/ContentEncoding'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProvenanceRegistration' }
+            examples:
+              umik: { externalValue: fixtures/provenance-registration.json }
+      responses:
+        '200':
+          description: Every record is registered (created now or already existing).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProvenanceRegistrationResult' }
+              examples:
+                registered: { externalValue: fixtures/responses/provenance-200.json }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: '`provenance_conflict`: an id is registered with different content or by another device. `details.conflicts` lists `{path, id, reason}` with reason `content_changed` or `registered_by_another_device`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '422':
+          description: '`validation_failed` (including an attachment whose `sha256` does not match its decoded bytes, or an uncalibrated profile listing SPL metrics), `malformed_json`, or `unsupported_schema_version`. Nothing is stored.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /measurements/batches:
     post:
       tags: [Measurements]
@@ -144,9 +207,10 @@ paths:
         Validates every record, then commits new rows, the batch receipt, and
         dirty-bucket/outbox markers in one transaction. Requires ability
         `measurements:write`. MVP records cover exactly 1,000 ms, aligned to a
-        UTC second boundary (start-inclusive, end-exclusive). Profiles,
-        deployments, calibrations and the configuration revision must already be
-        provisioned for this device.
+        UTC second boundary (start-inclusive, end-exclusive). Profiles and
+        calibrations must already be registered for this device (`POST
+        /provenance`); a non-null configuration revision must exist. The server
+        assigns each reading the placement in effect at `captured_at`.
       parameters:
         - $ref: '#/components/parameters/ContentEncoding'
         - $ref: '#/components/parameters/RequestId'
@@ -207,7 +271,8 @@ paths:
         `audio_dropout` or `microphone_disconnected`); `ended_at` is then where
         observation stopped, not where the sound ended, and the UI shows it so.
         Uncalibrated profiles must report null absolute SPL summary values and
-        may only trigger on `rms_dbfs`.
+        may only trigger on `rms_dbfs`. The server assigns the placement in
+        effect at `started_at`.
       parameters:
         - $ref: '#/components/parameters/ContentEncoding'
         - $ref: '#/components/parameters/RequestId'
@@ -404,8 +469,11 @@ paths:
         immutable document (never a merge patch) with its SHA-256 (also sent as
         a quoted `ETag`). Validate locally, apply at an interval boundary, then
         acknowledge. A failed or offline update leaves the previous valid
-        configuration active. `provenance` lists the immutable profile,
-        placement and calibration records the agent must reference on readings.
+        configuration active. Until a configuration is published (`404
+        not_found`) the agent measures on its local defaults and sends
+        `configuration_revision: null`. The document carries operational
+        settings only; it does not reference profiles, placements or
+        calibrations.
       parameters:
         - $ref: '#/components/parameters/RequestId'
       responses:
@@ -420,44 +488,6 @@ paths:
               schema: { $ref: '#/components/schemas/ConfigurationResult' }
               examples:
                 current: { externalValue: fixtures/responses/configuration-200.json }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '429': { $ref: '#/components/responses/RateLimited' }
-        '500': { $ref: '#/components/responses/InternalError' }
-        '503': { $ref: '#/components/responses/ServiceUnavailable' }
-  /calibrations/{calibration_uuid}/attachments/{attachment_uuid}:
-    get:
-      tags: [Configuration]
-      operationId: downloadCalibrationAttachment
-      summary: Download a calibration's microphone frequency-response file
-      description: |
-        Requires ability `configuration:read`. Serves only attachments with
-        purpose `frequency_response` that belong to one of this device's
-        calibration records (e.g. a miniDSP UMIK-1 serial-specific calibration
-        file). Paths are listed in `provenance.calibrations[].attachments[].download_path`.
-        The agent must verify the bytes against the listed `sha256` (also sent as
-        `X-Content-SHA256`). No other attachment purposes are ever served to devices.
-      parameters:
-        - name: calibration_uuid
-          in: path
-          required: true
-          schema: { type: string, format: uuid }
-        - name: attachment_uuid
-          in: path
-          required: true
-          schema: { type: string, format: uuid }
-        - $ref: '#/components/parameters/RequestId'
-      responses:
-        '200':
-          description: The exact stored bytes.
-          headers:
-            X-Content-SHA256:
-              description: Lowercase hex SHA-256 recorded when the file was stored.
-              schema: { type: string }
-          content:
-            application/octet-stream:
-              schema: { type: string, format: binary }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -637,7 +667,12 @@ components:
         rms_dbfs = digital RMS relative to full scale (dBFS, never dBA).
     QualityFlag:
       type: string
-      enum: [clipping, audio_dropout, microphone_disconnected, unsynchronized_clock, below_noise_floor, invalid_calibration, processing_error, incomplete_interval]
+      enum: [clipping, audio_dropout, microphone_disconnected, unsynchronized_clock, below_noise_floor, invalid_calibration, processing_error, incomplete_interval, max_duration_reached, ended_by_operator]
+      description: >-
+        `max_duration_reached` and `ended_by_operator` are used on finalized events only: the event
+        was still above threshold when `detection.max_event_duration_seconds` elapsed, or when the
+        owner stopped it on the device, so `ended_at` is where the device ended it, not where the
+        noise stopped.
     Level:
       type: [number, 'null']
       minimum: -200
@@ -681,6 +716,7 @@ components:
         | recording_conflict | 409 | never | true |
         | recording_already_verified | 409 | never | true |
         | upload_attempt_mismatch | 409 | never | true |
+        | provenance_conflict | 409 | after_correction | true |
         | payload_too_large | 413 | never | true |
         | malformed_json | 422 | never | true |
         | validation_failed | 422 | never | true |
@@ -703,6 +739,7 @@ components:
         - recording_conflict
         - recording_already_verified
         - upload_attempt_mismatch
+        - provenance_conflict
         - payload_too_large
         - malformed_json
         - validation_failed
@@ -728,7 +765,7 @@ components:
     MeasurementRecord:
       type: object
       additionalProperties: false
-      required: [boot_id, sequence, channel, captured_at, duration_ms, deployment_id, profile_id, configuration_revision]
+      required: [boot_id, sequence, channel, captured_at, duration_ms, profile_id]
       description: |
         At least one metric must be non-null, unless `quality_flags` explain the
         absence. A metric that the profile supports but is null needs a
@@ -742,13 +779,22 @@ components:
           allOf: [{ $ref: '#/components/schemas/Timestamp' }]
           description: Interval start; must be a whole UTC second.
         duration_ms: { type: integer, const: 1000 }
-        deployment_id: { $ref: '#/components/schemas/Uuid' }
-        profile_id: { $ref: '#/components/schemas/Uuid' }
+        deployment_id:
+          type: [string, 'null']
+          format: uuid
+          deprecated: true
+          description: Accepted from older agents and ignored. The server assigns the placement in effect at `captured_at` (greatest `effective_at <= captured_at`), or none.
+        profile_id:
+          allOf: [{ $ref: '#/components/schemas/Uuid' }]
+          description: A measurement profile registered for this device (`POST /provenance`).
         calibration_id:
           type: [string, 'null']
           format: uuid
-          description: Required for estimated/calibrated profiles (state must match); must be null/absent for uncalibrated profiles.
-        configuration_revision: { type: integer, minimum: 1 }
+          description: A calibration registered for this device. Required for estimated/calibrated profiles (state must match); must be null/absent for uncalibrated profiles.
+        configuration_revision:
+          type: [integer, 'null']
+          minimum: 1
+          description: The applied configuration revision, or null (or absent) while the agent runs on local defaults. A non-null revision must exist for the device.
         laeq_db: { $ref: '#/components/schemas/Level' }
         lafmax_db: { $ref: '#/components/schemas/Level' }
         lceq_db: { $ref: '#/components/schemas/Level' }
@@ -814,17 +860,17 @@ components:
     EventRevisionRequest:
       type: object
       additionalProperties: false
-      required: [schema_version, event_id, revision, channel, deployment_id, profile_id, configuration_revision, detection_state, started_at, detection]
+      required: [schema_version, event_id, revision, channel, profile_id, detection_state, started_at, detection]
       properties:
         schema_version: { type: integer, const: 1 }
         event_id: { $ref: '#/components/schemas/Uuid' }
         revision: { type: integer, minimum: 1, description: "Monotonically increasing per event." }
         sent_at: { type: [string, 'null'], format: date-time }
         channel: { $ref: '#/components/schemas/Channel' }
-        deployment_id: { $ref: '#/components/schemas/Uuid' }
+        deployment_id: { type: [string, 'null'], format: uuid, deprecated: true, description: 'Accepted and ignored; the server assigns the placement in effect at `started_at`.' }
         profile_id: { $ref: '#/components/schemas/Uuid' }
         calibration_id: { type: [string, 'null'], format: uuid }
-        configuration_revision: { type: integer, minimum: 1 }
+        configuration_revision: { type: [integer, 'null'], minimum: 1, description: 'null (or absent) while the agent runs on local defaults.' }
         detection_state: { type: string, enum: [open, finalized] }
         started_at: { $ref: '#/components/schemas/Timestamp' }
         ended_at: { type: [string, 'null'], format: date-time, description: 'null while open; required when finalized; must not precede started_at.' }
@@ -965,17 +1011,19 @@ components:
         measurement_interval_ms: { type: integer, const: 1000 }
         channels:
           type: array
+          description: |
+            Operational settings per channel, validated against the device's
+            reported capabilities. Revisions published before 2026-10-09 also
+            contain `measurement_profile_id`, `deployment_id`, `calibration_id`
+            and `calibration_state`; agents ignore them.
           items:
             type: object
+            required: [channel, enabled, metrics, bands_enabled]
             properties:
               channel: { $ref: '#/components/schemas/Channel' }
               enabled: { type: boolean }
               metrics: { type: array, items: { $ref: '#/components/schemas/MetricName' } }
               bands_enabled: { type: boolean }
-              measurement_profile_id: { $ref: '#/components/schemas/Uuid' }
-              deployment_id: { $ref: '#/components/schemas/Uuid' }
-              calibration_id: { type: [string, 'null'], format: uuid }
-              calibration_state: { type: string, enum: [uncalibrated, estimated, calibrated] }
         recording:
           type: object
           properties:
@@ -1004,6 +1052,13 @@ components:
                 baseline_window_seconds: { type: integer }
             min_event_duration_ms: { type: integer }
             merge_gap_ms: { type: integer }
+            max_event_duration_seconds:
+              type: integer
+              minimum: 60
+              maximum: 14400
+              description: >-
+                Optional (default 600). An event still above threshold after this many seconds is
+                finalized with `max_duration_reached`, and the device re-learns its baseline.
             observation_period_until: { type: [string, 'null'], format: date-time }
         local_retention:
           type: object
@@ -1015,7 +1070,8 @@ components:
       allOf:
         - $ref: '#/components/schemas/Envelope'
         - type: object
-          required: [revision, sha256, issued_at, configuration, provenance]
+          description: '`provenance` is no longer returned (agents ignore it if present).'
+          required: [revision, sha256, issued_at, configuration]
           properties:
             revision: { type: integer }
             sha256:
@@ -1025,76 +1081,105 @@ components:
             issued_at: { $ref: '#/components/schemas/Timestamp' }
             applied_revision: { type: [integer, 'null'] }
             configuration: { $ref: '#/components/schemas/ConfigurationDocument' }
-            provenance:
-              type: object
-              properties:
-                measurement_profiles: { type: array, items: { $ref: '#/components/schemas/ProvenanceProfile' } }
-                deployments: { type: array, items: { $ref: '#/components/schemas/ProvenanceDeployment' } }
-                calibrations: { type: array, items: { $ref: '#/components/schemas/ProvenanceCalibration' } }
-    ProvenanceProfile:
+    ProvenanceRegistration:
       type: object
-      required: [id, channel, revision, calibration_state, supported_metrics, sample_rate_hz, content_hash]
+      additionalProperties: false
+      required: [schema_version]
+      description: Either array may be empty or absent, but not both.
       properties:
-        id: { $ref: '#/components/schemas/Uuid' }
+        schema_version: { type: integer, const: 1 }
+        sent_at: { type: [string, 'null'], format: date-time }
+        measurement_profiles:
+          type: array
+          maxItems: 8
+          items: { $ref: '#/components/schemas/RegisteredProfile' }
+        calibrations:
+          type: array
+          maxItems: 8
+          items: { $ref: '#/components/schemas/RegisteredCalibration' }
+    RegisteredProfile:
+      type: object
+      additionalProperties: false
+      required: [id, channel, microphone_model, sample_rate_hz, weighting_implementation_version, filter_implementation_version, agent_processing_version, calibration_state, supported_metrics]
+      properties:
+        id: { allOf: [{ $ref: '#/components/schemas/Uuid' }], description: 'Device-generated, globally unique.' }
         channel: { $ref: '#/components/schemas/Channel' }
-        revision: { type: integer }
+        name: { type: [string, 'null'], maxLength: 255 }
+        microphone_model: { type: string, maxLength: 255 }
+        microphone_serial: { type: [string, 'null'], maxLength: 255 }
+        audio_interface: { type: [string, 'null'], maxLength: 255 }
+        sample_rate_hz: { type: integer, minimum: 1 }
+        gain_db: { type: [number, 'null'], minimum: -9999.99, maximum: 9999.99 }
+        gain_description: { type: [string, 'null'], maxLength: 255 }
+        weighting_implementation_version: { type: string, maxLength: 64 }
+        filter_implementation_version: { type: string, maxLength: 64 }
+        agent_processing_version: { type: string, maxLength: 64 }
         calibration_state: { type: string, enum: [uncalibrated, estimated, calibrated] }
-        microphone_model: { type: string }
-        microphone_serial: { type: [string, 'null'], description: "Agents may refuse to measure with a microphone whose serial differs." }
-        audio_interface: { type: [string, 'null'] }
-        gain_description: { type: [string, 'null'] }
-        calibration_application_method: { type: [string, 'null'] }
-        supported_metrics: { type: array, items: { $ref: '#/components/schemas/MetricName' } }
-        sample_rate_hz: { type: integer }
-        gain_db: { type: [number, 'null'] }
-        low_frequency_band_hz: { type: [array, 'null'], items: { type: number }, minItems: 2, maxItems: 2 }
-        band_definitions: { type: [object, 'null'] }
-        content_hash: { type: string }
-    ProvenanceDeployment:
+        calibration_application_method: { type: [string, 'null'], maxLength: 255 }
+        supported_metrics:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/MetricName' }
+          description: An uncalibrated profile may only list `rms_dbfs`.
+        low_frequency_lower_hz: { type: [number, 'null'], minimum: 0 }
+        low_frequency_upper_hz: { type: [number, 'null'], minimum: 0, description: 'Must exceed the lower edge.' }
+        band_centers_hz:
+          type: [array, 'null']
+          items: { type: number, enum: [20, 25, 31.5, 40, 50, 63, 80, 100, 125] }
+          description: Nominal third-octave centres the agent reports (Z-weighted).
+    RegisteredCalibration:
       type: object
-      required: [id, revision, effective_at, content_hash]
-      properties:
-        id: { $ref: '#/components/schemas/Uuid' }
-        revision: { type: integer }
-        effective_at: { $ref: '#/components/schemas/Timestamp' }
-        content_hash: { type: string }
-    ProvenanceCalibration:
-      type: object
-      required: [id, channel, revision, calibration_state, content_hash]
+      additionalProperties: false
+      required: [id, channel, calibration_state, reference_method]
       description: |
-        Owner-documented calibration chain. `sensitivity_dbfs_at_94db` is the RMS
-        dBFS reading the documented chain produces for 94 dB SPL at the reference
-        frequency; agents derive their absolute scale from it. No accuracy or
+        A documented calibration chain, never `uncalibrated`. A frequency-response
+        file alone does not establish absolute SPL calibration. No accuracy or
         uncertainty value is implied.
       properties:
-        id: { $ref: '#/components/schemas/Uuid' }
+        id: { allOf: [{ $ref: '#/components/schemas/Uuid' }], description: 'Device-generated, globally unique.' }
         channel: { $ref: '#/components/schemas/Channel' }
-        revision: { type: integer }
         calibration_state: { type: string, enum: [estimated, calibrated] }
-        reference_method: { type: string }
-        reference_device: { type: [string, 'null'] }
+        reference_method: { type: string, maxLength: 255 }
+        reference_device: { type: [string, 'null'], maxLength: 255 }
         reference_level_db: { type: [number, 'null'] }
-        reference_frequency_hz: { type: [number, 'null'] }
+        reference_frequency_hz: { type: [number, 'null'], minimum: 0 }
         sensitivity_mv_per_pa: { type: [number, 'null'] }
-        sensitivity_dbfs_at_94db: { type: [number, 'null'] }
-        gain_configuration: { type: [string, 'null'] }
-        application_method: { type: [string, 'null'] }
-        correction_metadata: { type: [object, array, 'null'] }
+        sensitivity_dbfs_at_94db: { type: [number, 'null'], description: 'RMS dBFS the chain produces for 94 dB SPL at the reference frequency.' }
+        gain_configuration: { type: [string, 'null'], maxLength: 255 }
+        application_method: { type: [string, 'null'], maxLength: 255 }
         performed_at: { type: [string, 'null'], format: date-time }
+        performed_by: { type: [string, 'null'], maxLength: 255 }
+        notes: { type: [string, 'null'], maxLength: 10000 }
         attachments:
           type: array
-          items: { $ref: '#/components/schemas/ProvenanceAttachment' }
-        content_hash: { type: string }
-    ProvenanceAttachment:
+          maxItems: 4
+          items: { $ref: '#/components/schemas/RegisteredAttachment' }
+    RegisteredAttachment:
       type: object
-      required: [id, purpose, filename, byte_size, sha256, download_path]
+      additionalProperties: false
+      required: [purpose, filename, sha256, content_base64]
+      properties:
+        purpose: { type: string, enum: [frequency_response, certificate, photo, other] }
+        filename: { type: string, maxLength: 255 }
+        media_type: { type: [string, 'null'], maxLength: 128 }
+        sha256: { type: string, pattern: '^[0-9a-fA-F]{64}$', description: 'SHA-256 of the decoded bytes; must match.' }
+        content_base64: { type: string, contentEncoding: base64, description: 'The file bytes (at most 1 MiB decoded).' }
+    ProvenanceRegistrationResult:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [measurement_profiles, calibrations]
+          properties:
+            measurement_profiles: { type: array, items: { $ref: '#/components/schemas/RegistrationStatus' } }
+            calibrations: { type: array, items: { $ref: '#/components/schemas/RegistrationStatus' } }
+    RegistrationStatus:
+      type: object
+      required: [id, revision, status]
       properties:
         id: { $ref: '#/components/schemas/Uuid' }
-        purpose: { type: string, enum: [frequency_response] }
-        filename: { type: string }
-        byte_size: { type: integer }
-        sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
-        download_path: { type: string, description: "Path on the API origin; authenticate with the device token." }
+        revision: { type: integer, description: 'Server-assigned revision per device and channel.' }
+        status: { type: string, enum: [created, existing] }
     ConfigurationAcknowledgment:
       type: object
       additionalProperties: false

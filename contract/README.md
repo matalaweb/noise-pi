@@ -20,17 +20,18 @@ The live test passed against the web app at the vendored commit (2026-10-08).
 1. **Configuration hash.** `sha256` is checked against the canonical JSON rules of the web app's
    `App\Support\CanonicalJson` (PHP float spelling verified against PHP 8), after re-typing the
    fields `buildDocument()` casts to float. See server issue 1.
-2. **Channel and provenance.** The collector serves one channel (`[channel] id`, e.g. `mic-1`). It
-   uses the configuration's channel entry and the referenced profile, deployment, and calibration
-   from `provenance`. A configuration that it can't honor is rejected with a reason, and the
-   previous one stays active. Examples: missing channel, third-octave bands, an LCpeak trigger,
-   or an unvalidated sample rate.
-3. **Absolute scale and response.** The scale comes from the calibration's
-   `sensitivity_dbfs_at_94db`. The response correction comes from its `frequency_response`
-   attachment, which is downloaded, SHA-256-verified, and serial-checked. The local
-   `calibrations.toml` is a fallback for older servers. Without a scale, SPL fields are `null` with
-   `null_reasons: calibration_unavailable` and the flag `invalid_calibration`, while dBFS
-   continues.
+2. **Device-reported measurement chain** (2026-10-09, `device-reported-provenance.md`). The
+   collector builds its measurement profile and calibration from `collector.toml` and the local
+   frequency-response file, registers them with `POST /api/v1/device/provenance` before sending
+   anything that references them, and re-registers on `unknown_provenance`. Readings carry no
+   placement: the server assigns the one in effect at capture time. Before any configuration is
+   published the collector runs on local defaults and sends `configuration_revision: null`.
+   Configuration documents carry operational settings only; a configuration it can't honor is
+   rejected with a reason and the previous one stays active (missing channel, third-octave bands,
+   an LCpeak trigger).
+3. **Absolute scale and response.** Both come from `[calibration]` (docs/calibration.md). Without
+   a scale, SPL fields are `null` with `null_reasons: calibration_unavailable` and the flag
+   `invalid_calibration`, while dBFS continues.
 4. **Detection mapping.**
    - `min_event_duration_ms` sets the number of consecutive qualifying seconds.
    - `merge_gap_ms` sets the quiet seconds needed to end an event; post-roll is raised to at
@@ -74,11 +75,9 @@ The live test passed against the web app at the vendored commit (2026-10-08).
    the in-memory build (`delta_db` as the float `15.0`), while the JSON column serves `15`. Fixed:
    `DeviceConfigurationService::publish()` now hashes the stored form. The collector accepts the
    plain hash, and still accepts the float-typed hash for revisions published before the fix.
-2. **Provenance lacked calibration and identity details.** Fixed:
-   - calibrations now carry the sensitivity, reference, gain, method, and correction fields, plus
-     their `frequency_response` attachments (sha256 and `download_path`);
-   - new route `GET /api/v1/device/calibrations/{id}/attachments/{id}`;
-   - profiles carry the microphone model and serial.
+2. **Provenance lacked calibration and identity details.** First fixed by serving them in the
+   configuration; superseded on 2026-10-09 by device-reported provenance (decision 2), which
+   removed that route and the configuration's `provenance` block.
 
    Also fixed: `Attachment::$fillable` lacked `uuid`, so attaching any file in the panel failed.
 3. **Unknown event end.** The protocol is kept: finalized at the last observed second with

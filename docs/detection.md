@@ -42,6 +42,14 @@ thresholds, the baseline values, and provenance are frozen into the event.
   provisional end. After finalization, a new trigger creates a new event.
 * Data loss while active ends the event as `incomplete` with `ended_at: null`. Data loss during
   post-roll keeps the known detection end and truncates the recording.
+* **Maximum duration.** An event still active `max_event_duration_seconds` after its first
+  qualifying second (default 600 s; 60 to 14400; set in the web app's detection rules) ends there:
+  no post-roll, flag `max_duration_reached` (the duration is a lower bound; the web app shows
+  "≥ …"). All baselines are then cleared and re-learnt at the current level. So a lasting level
+  shift (a door left open, a fan) stops producing events once re-learnt (about 2 minutes of
+  warmup), while sound above an absolute threshold keeps producing back-to-back events of at most
+  that length. A long genuine disturbance that only a relative rule catches becomes the new
+  baseline; add an absolute rule to keep catching it.
 * Threshold changes made during an event apply after it ends. Profile, gain, or deployment
   changes force a split. Recording-disable takes effect immediately; measurements continue.
 

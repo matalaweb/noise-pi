@@ -20,17 +20,18 @@ from .timeutil import iso_utc
 
 
 def _applied_profile(args):
+    """The local measurement chain's profile (what the collector measures with)."""
     try:
+        from .config.chain import build_chain
         from .config.settings import load_settings
-        from .store.db import connect
+        from .store.db import connect, get_meta
 
         s = load_settings(args.config and __import__("pathlib").Path(args.config))
-        conn = connect(s.db_path, readonly=True)
-        from .config.local_inputs import local_inputs
-        from .contract.configuration import translate
-
-        row = conn.execute("SELECT document_json FROM configurations WHERE state='applied' ORDER BY revision DESC LIMIT 1").fetchone()
-        return s, (translate(json.loads(row["document_json"]), local_inputs(s), verify_hash=False).profile if row else None)
+        try:
+            install = get_meta(connect(s.db_path, readonly=True), "installation_id") or "unregistered"
+        except Exception:
+            install = "unregistered"
+        return s, build_chain(s, install).profile
     except Exception:
         return None, None
 
@@ -113,9 +114,14 @@ def run(args) -> dict:
         out["profile_scale_pa_per_fs"] = ps
         out["level_with_profile_scale_db"] = round(20 * math.log10(rms * ps / P0), 3)
         out["profile_minus_reference_db"] = round(20 * math.log10(ps / measured_scale), 3)
-    out["calibrations_toml_entry_hint"] = {
-        "pa_per_fs": measured_scale,
+    # Paste into /etc/noise-collector/collector.toml [calibration], then restart: the collector
+    # registers the new calibration with the server and uses it from then on.
+    out["collector_toml_calibration_hint"] = {
+        "state": "calibrated",
         "sensitivity_dbfs_at_94db": round(20 * math.log10(10 ** (94 / 20) * P0 / measured_scale), 4),
-        "method": "reference_measurement",
+        "reference_method": "94 dB / 1 kHz acoustic calibrator",
+        "reference_level_db": 94.0,
+        "reference_frequency_hz": 1000.0,
+        "performed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     return out

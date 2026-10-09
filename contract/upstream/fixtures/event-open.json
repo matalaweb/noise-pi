@@ -4,7 +4,6 @@
   "revision": 1,
   "sent_at": "2026-10-08T12:15:36.000Z",
   "channel": "mic-1",
-  "deployment_id": "{{DEPLOYMENT_ID}}",
   "profile_id": "{{PROFILE_ID}}",
   "calibration_id": "{{CALIBRATION_ID}}",
   "configuration_revision": "{{CONFIGURATION_REVISION}}",

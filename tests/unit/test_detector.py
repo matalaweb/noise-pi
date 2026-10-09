@@ -139,6 +139,7 @@ def test_data_loss_in_post_roll_keeps_detection_end():
 
 def test_baseline_frozen_during_event_and_excludes_recovery():
     det = make(recovery_seconds=30)
+    det.settings = det.settings.model_copy(update={"max_event_seconds": 3600})
     k = warm(det, level=40.0)
     feed(det, [70.0] * 600, start=k)  # long loud event: baseline must not adapt
     assert det.frozen.baseline["laeq_db"] == 40.0
@@ -204,3 +205,63 @@ def test_replay_determinism_same_inputs_same_actions():
     a1 = [(s, repr(a)) for s, a in feed(make(), seq)]
     a2 = [(s, repr(a)) for s, a in feed(make(), seq)]
     assert a1 == a2 and len(a1) >= 4
+
+
+def test_level_shift_ends_at_max_duration_and_relearns_the_baseline():
+    # a door opened and left open: the level settles 4 dB above the frozen baseline, above the
+    # hysteresis exit (threshold 52 - 3 = 49 with delta 12 -> use delta 6: 46 - 3 = 43 < 44)
+    rel6 = Rule(id="a", kind="relative", metric="laeq_db", delta_db=6, consecutive_seconds=2)
+    det = make([rel6])
+    det.settings = det.settings.model_copy(update={"max_event_seconds": 120})
+    warm(det)
+    acts = feed(det, [70.0] * 20 + [44.0] * 200, start=120)
+    starts = [(k, a) for k, a in acts if isinstance(a, EventStart)]
+    ends = [(k, a) for k, a in acts if isinstance(a, EventEnd)]
+    assert len(starts) == 1 and starts[0][1].start_second == 120
+    assert len(ends) == 1
+    k, end = ends[0]
+    assert end.reason == "max_duration" and end.provisional_end_second == end.post_roll_end_second == 240 and k == 239
+    # baselines re-learn at the new level: warming, then idle at ~44 dB, no retrigger
+    assert det.state in (WARMING, IDLE)
+    assert feed(det, [44.0] * 130, start=340) == []
+    assert det.state == IDLE and abs(det.baselines["laeq_db"].value(470) - 44.0) < 1e-9
+
+
+def test_sustained_level_above_an_absolute_rule_starts_a_new_event_after_max_duration():
+    ab = Rule(id="abs", kind="absolute", metric="laeq_db", threshold_db=60, consecutive_seconds=2)
+    det = make([ab])
+    det.settings = det.settings.model_copy(update={"max_event_seconds": 60})
+    acts = feed(det, [70.0] * 200)
+    kinds = [type(a).__name__ for _, a in acts]
+    # events [0, 60), [60, 120), [120, 180), and a fourth still open at 199
+    assert kinds.count("EventStart") == 4 and kinds.count("EventEnd") == 3
+    assert all(a.reason == "max_duration" for _, a in acts if isinstance(a, EventEnd))
+
+
+def test_quiet_end_before_max_duration_is_unchanged():
+    det = make()
+    warm(det)
+    acts = feed(det, [70.0] * 10 + [40.0] * 40, start=120)
+    end = next(a for _, a in acts if isinstance(a, EventEnd))
+    assert end.reason is None and end.provisional_end_second == 130
+
+
+def test_owner_stop_ends_an_active_event_now_and_relearns():
+    det = make()
+    warm(det)
+    feed(det, [70.0] * 10, start=120)
+    assert det.state == ACTIVE
+    (end,) = det.force_end(129)
+    assert isinstance(end, EventEnd) and end.reason == "operator_stop"
+    assert end.provisional_end_second == end.post_roll_end_second == 130
+    assert det.state == WARMING and det.baselines["laeq_db"].count(130) == 0
+
+
+def test_owner_stop_in_post_roll_keeps_the_detection_end_and_cuts_post_roll():
+    det = make()
+    warm(det)
+    feed(det, [70.0] * 10 + [40.0] * 8, start=120)
+    assert det.state == POST_ROLL
+    (end,) = det.force_end(137)
+    assert end.provisional_end_second == 130 and end.post_roll_end_second == 138 and end.reason == "operator_stop_post_roll"
+    assert det.force_end(138) == []  # nothing open any more

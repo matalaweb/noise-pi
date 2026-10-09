@@ -1,9 +1,10 @@
 """End-to-end contract test against a real running Laravel app (skipped unless configured).
 
-Runs the real collector pipeline: fetch + verify + stage the server configuration, replay
-SYNTHETIC audio through the engine with that configuration, then deliver measurements, event
-revisions, the acknowledgment, a heartbeat and the event recording (declare -> presigned PUT ->
-complete -> server verification), and checks idempotent replay.
+Runs the real collector pipeline: build the local measurement chain (SYNTHETIC calibrated profile
+with a frequency-response file), fetch + verify + stage any server configuration (or run on local
+defaults), replay SYNTHETIC audio through the engine, then deliver: chain registration, measurements,
+event revisions, the acknowledgment, a heartbeat and the event recording (declare -> presigned PUT ->
+complete -> server verification), and check idempotent replay of batches and registration.
 
     scripts/run_live_contract_test.sh   # provisions a demo device in the local Docker stack and runs this
 
@@ -22,9 +23,10 @@ import pytest
 
 from noise_collector.acquisition.durability import record_config_ack
 from noise_collector.acquisition.replay import replay
+from noise_collector.config.chain import build_chain, installation_id, store_records
 from noise_collector.config.local_inputs import local_inputs
 from noise_collector.config.settings import Settings
-from noise_collector.contract.configuration import translate
+from noise_collector.contract.configuration import effective, local_defaults, parse_document
 from noise_collector.delivery.service import DeliveryService
 from noise_collector.store.db import connect, migrate
 from noise_collector.synth import Burst, Scenario, write_wav
@@ -43,48 +45,50 @@ def test_end_to_end_against_real_laravel(tmp_path: Path):
     cred = tmp_path / "cred.toml"
     cred.write_text(f'device_token = "{TOKEN}"\n')
     os.chmod(cred, 0o600)
-    cal_file = tmp_path / "calibrations.toml"
+    resp = tmp_path / "SIM-0001_90deg.txt"
+    resp.write_text('"Sens Factor =0.0dB, AGain =18dB, SERNO: SIM-0001"\n10.0\t-1.5\n100.0\t-0.2\n1000.0\t0.0\n10000.0\t0.8\n20000.0\t-1.2\n')
     s = Settings.model_validate({
-        "paths": {"state_dir": str(tmp_path / "state"), "credentials_file": str(cred), "calibrations_file": str(cal_file)},
+        "paths": {"state_dir": str(tmp_path / "state"), "credentials_file": str(cred)},
         "server": {"base_url": URL, "allow_insecure_http_for_tests": URL.startswith("http:"),
                    "trusted_storage_hosts": [h for h in os.environ.get("NOISE_LARAVEL_STORAGE_HOSTS", "").split(",") if h]},
         "channel": {"id": os.environ.get("NOISE_LARAVEL_CHANNEL", "mic-1")},
-        "microphone": {"gain_reference_check": "live contract test: SYNTHETIC audio, no physical gain"},
+        "microphone": {"gain_reference_check": "live contract test: SYNTHETIC audio, no physical gain",
+                       "microphone_model": "SYNTHETIC UMIK-like microphone"},
+        "calibration": {"state": "calibrated", "sensitivity_dbfs_at_94db": -18.0, "reference_method": "SYNTHETIC live contract test",
+                        "frequency_response_file": str(resp)},
     })
     s.state_dir.mkdir(parents=True)
     migrate(s.db_path)
     svc = DeliveryService(s, TOKEN)
     conn = connect(s.db_path)
 
-    # 1. configuration: fetch, verify canonical hash, translate, stage
+    # 1. local chain + configuration (published revision if any, else local defaults)
+    chain = build_chain(s, installation_id(conn))
+    assert chain.profile.microphone_serial == "SIM-0001" and chain.profile.response_correction.method == "fir_min_phase_v1"
+    store_records(conn, chain)
     svc._poll_config(conn)
     row = conn.execute("SELECT revision, document_json FROM configurations WHERE state='staged'").fetchone()
-    assert row is not None, svc.lane_errors
-    result = json.loads(row["document_json"])
-    from noise_collector.contract.configuration import document_hash
+    op = local_defaults(local_inputs(s))
+    if row is not None:
+        result = json.loads(row["document_json"])
+        from noise_collector.contract.configuration import document_hash
 
-    assert document_hash(result["configuration"]) == result["sha256"]  # served document reproduces its hash
-    cals = [c for c in result["provenance"]["calibrations"] if c.get("sensitivity_dbfs_at_94db") is None]
-    if cals:  # SYNTHETIC scale for calibrations without a server sensitivity, pinned to its content hash
-        cal_file.write_text("".join(
-            f'[[calibration]]\nid = "{c["id"]}"\ncontent_hash = "{c["content_hash"]}"\nmethod = "reference_measurement"\n'
-            f"sensitivity_dbfs_at_94db = -18.0\n\n" for c in cals))
-    cfg = translate(result, local_inputs(s))
-    assert cfg.profile.mode == "uncalibrated" or cfg.profile.scale is not None
-    if os.environ.get("NOISE_LARAVEL_EXPECT_CALIBRATION_FILE"):
-        assert any(c.get("attachments") for c in result["provenance"]["calibrations"])
-    if any(c.get("attachments") for c in result["provenance"]["calibrations"]):
-        # calibration file downloaded from the server, hash-verified, serial-checked and applied
-        assert cfg.profile.scale.method == "server_sensitivity"
-        assert cfg.profile.response_correction.method == "fir_min_phase_v1"
-        assert list((s.state_dir / "profiles").iterdir())
+        assert document_hash(result["configuration"]) == result["sha256"]  # served document reproduces its hash
+        assert "provenance" not in result
+        op = parse_document(result, local_inputs(s))
+    cfg = effective(op, chain.profile, chain.notes)
+    if cfg.revision is None:  # local defaults have no detection rule; the test needs an event
+        from noise_collector.contract.configuration import DetectionSettings
+
+        cfg = cfg.model_copy(update={"detection": DetectionSettings()})
 
     # 2. capture: SYNTHETIC audio ending a minute ago, processed by the real engine
     wav = tmp_path / "synthetic.wav"
     write_wav(str(wav), Scenario(duration_s=240, background_dbfs=-60, bursts=[Burst(150, 20, "engine_like", -30)], seed=9).render())
     start = float(int(time.time()) - 300)
-    replay(str(wav), s.state_dir, cfg, start_utc=start)
-    record_config_ack(conn, cfg.revision, "applied", iso_utc(time.time()), None, "; ".join(cfg.notes) or None, cfg.sha256)
+    replay(str(wav), s.state_dir, cfg, start_utc=start, provenance_records=chain.records)
+    if cfg.revision is not None:
+        record_config_ack(conn, cfg.revision, "applied", iso_utc(time.time()), None, "; ".join(cfg.notes) or None, cfg.sha256)
     assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] >= 1
 
     # 3. delivery until everything is acknowledged and verified
@@ -105,8 +109,10 @@ def test_end_to_end_against_real_laravel(tmp_path: Path):
     assert r and set(r) == {"verified"}, (r, errors)
     for rec in conn.execute("SELECT * FROM recordings"):
         assert rec["verified_sha256"] == rec["sha256"]
-    assert conn.execute("SELECT delivery_state FROM config_acknowledgments").fetchone()[0] == "acknowledged"
+    if cfg.revision is not None:
+        assert conn.execute("SELECT delivery_state FROM config_acknowledgments").fetchone()[0] == "acknowledged"
     assert svc.last_heartbeat_success is not None
+    assert {r[0] for r in conn.execute("SELECT state FROM provenance_records")} == {"registered"}
 
     # 4. idempotency: resending an acknowledged batch is a replay, never a duplicate
     payload = conn.execute("SELECT payload FROM outbox_batches WHERE state='acknowledged' LIMIT 1").fetchone()["payload"]
@@ -114,3 +120,13 @@ def test_end_to_end_against_real_laravel(tmp_path: Path):
 
     out = svc.api.request("POST", "/api/v1/device/measurements/batches", content=payload.encode(), model=BatchResult)
     assert out.ok and out.model.replayed is True and out.model.inserted_count + out.model.duplicate_count == out.model.record_count
+
+    # 5. registration is idempotent: the same records again are "existing", never new revisions
+    with __import__("noise_collector.store.db", fromlist=["transaction"]).transaction(conn):
+        conn.execute("UPDATE provenance_records SET state='pending', next_attempt_at=0")
+    from noise_collector.delivery import provenance
+
+    result, out = provenance.register(svc.api, conn, time.time(), lambda *_: 60)
+    assert result == "registered", (result, out and out.body)
+    statuses = [i["status"] for k in ("measurement_profiles", "calibrations") for i in out.body[k]]
+    assert statuses == ["existing", "existing"]

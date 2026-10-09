@@ -33,7 +33,10 @@ def make_settings(tmp_path: Path, state_dir: Path):
             "paths": {"state_dir": str(state_dir), "credentials_file": str(cred)},
             "server": {"base_url": API, "trusted_storage_hosts": [STORAGE_HOST]},
             "microphone": {"usb_vendor_id": "2752", "usb_product_id": "0007", "usb_serial": "7000001",
-                           "gain_reference_check": "test: synthetic, no physical gain"},
+                           "gain_reference_check": "test: synthetic, no physical gain",
+                           "microphone_model": "SYNTHETIC test microphone"},
+            # SYNTHETIC calibrated chain: 94 dB SPL reads -18 dBFS (the examples' placeholder scale).
+            "calibration": {"state": "calibrated", "sensitivity_dbfs_at_94db": -18.0, "reference_method": "SYNTHETIC test"},
             "channel": {"id": "mic-1"},
         }
         for k, v in overrides.items():

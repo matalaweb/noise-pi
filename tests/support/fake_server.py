@@ -10,6 +10,7 @@ server contract test is tests/integration/test_laravel_contract.py.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -30,10 +31,10 @@ METRICS = ("laeq_db", "lafmax_db", "lceq_db", "lcpeak_db", "low_frequency_leq_db
 RETRY = {
     "invalid_credentials": "after_correction", "forbidden_ability": "after_correction", "rate_limited": "backoff",
     "service_unavailable": "backoff", "internal_error": "backoff", "clock_future_timestamp": "after_clock_sync",
-    "unknown_provenance": "after_configuration_refresh",
+    "unknown_provenance": "after_configuration_refresh", "provenance_conflict": "after_correction",
 }
 STATUS = {
-    "invalid_credentials": 401, "forbidden_ability": 403, "not_found": 404, "batch_conflict": 409, "measurement_conflict": 409,
+    "invalid_credentials": 401, "forbidden_ability": 403, "not_found": 404, "batch_conflict": 409, "provenance_conflict": 409, "measurement_conflict": 409,
     "event_revision_conflict": 409, "event_terminal": 409, "recording_conflict": 409, "recording_already_verified": 409,
     "upload_attempt_mismatch": 409, "payload_too_large": 413, "malformed_json": 422, "validation_failed": 422,
     "unsupported_schema_version": 422, "clock_future_timestamp": 422, "outside_backfill_window": 422,
@@ -96,7 +97,10 @@ class FakeServer:
     log: list[tuple] = field(default_factory=list)
     storage_requests: list[httpx.Request] = field(default_factory=list)
     schema_violations: list[tuple[str, list[str]]] = field(default_factory=list)
-    files: dict[str, bytes] = field(default_factory=dict)  # calibration attachment id -> bytes served
+    # Device-registered measurement chain: id -> (content hash, record)
+    profiles: dict[str, tuple[str, dict]] = field(default_factory=dict)
+    calibrations: dict[str, tuple[str, dict]] = field(default_factory=dict)
+    provenance_posts: list[dict] = field(default_factory=list)
 
     # -- fault helpers -----------------------------------------------------------------------
 
@@ -164,23 +168,48 @@ class FakeServer:
 
     # -- provenance --------------------------------------------------------------------------
 
-    def _channel_cfg(self, channel: str) -> tuple[dict, dict, dict | None]:
-        if not self.config_result:
+    def _resolve(self, rec: dict) -> tuple[dict, dict | None]:
+        """Profile/calibration referenced by a record: must be registered by this device."""
+        prof = self.profiles.get(rec["profile_id"])
+        cal = self.calibrations.get(rec["calibration_id"]) if rec.get("calibration_id") else None
+        if prof is None or (rec.get("calibration_id") and cal is None):
             raise ApiError("unknown_provenance")
-        doc = self.config_result["configuration"]
-        ch = next((c for c in doc["channels"] if c["channel"] == channel), None)
-        if ch is None:
-            raise ApiError("validation_failed", "channel")
-        prov = self.config_result["provenance"]
-        prof = next(p for p in prov["measurement_profiles"] if p["id"] == ch["measurement_profile_id"])
-        cal = next((c for c in prov["calibrations"] if c["id"] == ch["calibration_id"]), None)
-        return ch, prof, cal
+        prof_rec, cal_rec = prof[1], cal[1] if cal else None
+        rev = rec.get("configuration_revision")
+        if rev is not None and (not self.config_result or rev > self.config_result["revision"]):
+            raise ApiError("unknown_provenance", "configuration revision")
+        if prof_rec["channel"] != rec["channel"]:
+            raise ApiError("validation_failed", "profile channel")
+        if prof_rec["calibration_state"] == "uncalibrated" and cal_rec is not None:
+            raise ApiError("validation_failed", "uncalibrated profile with calibration")
+        if prof_rec["calibration_state"] != "uncalibrated" and (cal_rec is None or cal_rec["calibration_state"] != prof_rec["calibration_state"]):
+            raise ApiError("validation_failed", "calibration state")
+        return prof_rec, cal_rec
 
-    def _check_provenance(self, rec: dict) -> None:
-        ch, prof, _cal = self._channel_cfg(rec["channel"])
-        if (rec["deployment_id"] != ch["deployment_id"] or rec["profile_id"] != prof["id"]
-                or rec.get("calibration_id") != ch["calibration_id"] or rec["configuration_revision"] != self.config_result["revision"]):
-            raise ApiError("unknown_provenance")
+    def _provenance(self, request: httpx.Request) -> httpx.Response:
+        b = self._body(request, "ProvenanceRegistration")
+        self.provenance_posts.append(b)
+        out: dict = {"measurement_profiles": [], "calibrations": []}
+        staged: list[tuple[dict, str, str, dict]] = []
+        for key, store in (("measurement_profiles", self.profiles), ("calibrations", self.calibrations)):
+            for rec in b.get(key, []):
+                for att in rec.get("attachments", []):
+                    if hashlib.sha256(base64.b64decode(att["content_base64"])).hexdigest() != att["sha256"]:
+                        raise ApiError("validation_failed", "attachment sha256")
+                if key == "measurement_profiles" and rec["calibration_state"] == "uncalibrated" and set(rec["supported_metrics"]) - {"rms_dbfs"}:
+                    raise ApiError("validation_failed", "uncalibrated profile supports rms_dbfs only")
+                body = {k: v for k, v in rec.items() if k != "id"}
+                if "attachments" in body:
+                    body["attachments"] = [{k: v for k, v in a.items() if k != "content_base64"} for a in body["attachments"]]
+                h = _h(body)
+                prior = store.get(rec["id"])
+                if prior is not None and prior[0] != h:
+                    raise ApiError("provenance_conflict", f"{rec['id']} already registered with other content")
+                staged.append((store, rec["id"], h, rec))
+                out[key].append({"id": rec["id"], "revision": 1, "status": "existing" if prior else "created"})
+        for store, rid, h, rec in staged:
+            store.setdefault(rid, (h, rec))
+        return self._envelope(200, out)
 
     # -- API -------------------------------------------------------------------------------
 
@@ -200,7 +229,7 @@ class FakeServer:
             ("GET", r"/api/v1/device/recordings/([^/]+)", self._status, "status"),
             ("GET", r"/api/v1/device/configuration", self._config, "config"),
             ("POST", r"/api/v1/device/configuration/acknowledgments", self._ack, "acks"),
-            ("GET", r"/api/v1/device/calibrations/([^/]+)/attachments/([^/]+)", self._attachment, "attachment"),
+            ("POST", r"/api/v1/device/provenance", self._provenance, "provenance"),
             ("POST", r"/api/v1/device/heartbeat", self._heartbeat, "heartbeat"),
         ]
         for method, pattern, fn, name in routes:
@@ -232,8 +261,7 @@ class FakeServer:
                 raise ApiError("clock_future_timestamp")
             if start < now - 30 * 86400:
                 raise ApiError("outside_backfill_window")
-            self._check_provenance(r)
-            _ch, prof, _cal = self._channel_cfg(r["channel"])
+            prof, _cal = self._resolve(r)
             absolute_ok = prof["calibration_state"] != "uncalibrated"
             for m in METRICS:
                 applicable = m in prof["supported_metrics"] and (m == "rms_dbfs" or absolute_ok)
@@ -280,8 +308,7 @@ class FakeServer:
             raise ApiError("validation_failed", "finalized event requires ended_at")
         if b.get("ended_at") and _parse(b["ended_at"]) < _parse(b["started_at"]):
             raise ApiError("validation_failed", "ended_at precedes started_at")
-        self._check_provenance(b)
-        _ch, prof, _cal = self._channel_cfg(b["channel"])
+        prof, _cal = self._resolve(b)
         if prof["calibration_state"] == "uncalibrated":
             if b["detection"]["trigger_metric"] != "rms_dbfs":
                 raise ApiError("validation_failed", "uncalibrated triggers on rms_dbfs only")
@@ -441,16 +468,6 @@ class FakeServer:
                 self.applied_revision = b["revision"]
         return self._envelope(200 if duplicate else 201, {"revision": b["revision"], "status": b["status"], "recorded": not duplicate,
                                                           "desired_config_revision": self._desired(), "applied_config_revision": self.applied_revision})
-
-    def _attachment(self, request: httpx.Request, cal_id: str, att_id: str) -> httpx.Response:
-        cals = (self.config_result or {}).get("provenance", {}).get("calibrations", [])
-        cal = next((c for c in cals if c["id"] == cal_id), None)
-        att = next((a for a in (cal or {}).get("attachments", []) if a["id"] == att_id and a["purpose"] == "frequency_response"), None)
-        if att is None or att_id not in self.files:
-            raise ApiError("not_found")
-        data = self.files[att_id]
-        return httpx.Response(200, content=data, headers={"Content-Type": "application/octet-stream",
-                                                          "X-Content-SHA256": att["sha256"], "X-Request-Id": str(uuid.uuid4())})
 
     def _desired(self) -> int | None:
         return self.config_result["revision"] if self.config_result else None

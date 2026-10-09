@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "noise-collector"
-version = "0.1.0"
+version = "0.2.0"
 description = "Raspberry Pi noise-monitoring collector: capture, DSP, event evidence, durable delivery"
 readme = "README.md"
 requires-python = ">=3.11"

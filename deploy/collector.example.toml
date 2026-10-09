@@ -4,8 +4,6 @@
 [paths]
 state_dir = "/var/lib/noise-collector"
 credentials_file = "/etc/noise-collector/credentials.toml"
-# Absolute scales for server calibration records (see docs/calibration.md). Optional.
-calibrations_file = "/etc/noise-collector/calibrations.toml"
 
 [server]
 base_url = "https://noise.example.com"
@@ -22,16 +20,36 @@ max_batches_per_minute = 50
 model = "umik-1"
 usb_path = ""               # e.g. "1-1.2"
 usb_serial = ""
-# The calibration record in the web app carries the serial-specific file(s); if both the 0deg and
-# the 90deg file are attached, choose the one matching how the microphone is mounted.
-calibration_orientation = "90deg"   # "0deg" = pointing at the source, "90deg" = pointing up
-# Other microphones: set usb_vendor_id / usb_product_id plus usb_serial or usb_path, and either
-# expected_gain_controls (from `noise-collector devices`) or gain_reference_check.
+# Reported to the server in the measurement profile. For a UMIK-1 the model defaults to
+# "miniDSP UMIK-1" and the serial to the calibration file's SERNO, so these can stay empty.
+microphone_model = ""
+microphone_serial = ""
+# Other microphones: set usb_vendor_id / usb_product_id plus usb_serial or usb_path, microphone_model,
+# and either expected_gain_controls (from `noise-collector devices`) or gain_reference_check.
+
+[measurement]
+sample_rate_hz = 48000              # the UMIK-1 runs at 48 kHz only
+low_frequency_band_hz = [20, 125]
+
+[calibration]
+# This device's calibration, reported to the server with the measurement profile (the web app shows
+# it read-only; nothing has to be entered or matched there). See docs/calibration.md.
+#   "uncalibrated": dBFS only. "estimated": approximate SPL. "calibrated": a documented chain.
+state = "estimated"
+# Serial-specific frequency-response file from miniDSP: <serial>.txt when the microphone points at
+# the source, <serial>_90deg.txt when it points up. Its SERNO is the reported microphone serial.
+frequency_response_file = "/etc/noise-collector/REPLACE_90deg.txt"
+# RMS dBFS reading for 94 dB SPL at 1 kHz. For an estimated UMIK-1 chain leave it unset: it is
+# derived from the file's Sens Factor (Sens Factor - 30). After a calibrator check
+# (`noise-collector calibration-check`) set state = "calibrated", this value, reference_method and
+# performed_at.
+# sensitivity_dbfs_at_94db = -30.082
+# reference_method = "94 dB / 1 kHz acoustic calibrator"
 
 [capture]
 # UMIK-1: S24_3LE at 48 kHz; most units expose 2 identical channels, some are mono. Use the native
 # channel count reported by `noise-collector umik`; channel 0 is analysed (channels are compared,
-# never averaged). The sample rate comes from the web-app profile (48000 for the UMIK-1).
+# never averaged). The sample rate is [measurement] sample_rate_hz.
 container = "int24"
 valid_bits = 24
 channels = 2

@@ -105,7 +105,9 @@ def classify(resp: httpx.Response, model: type[BaseModel] | None) -> Outcome:
         return Outcome(REDIRECT, st, None, error_code="redirect_refused", request_id=rid)
     retry_after = _retry_after(resp.headers.get("retry-after"))
     hint = err.retry if err else None
-    if st in (401, 403) or hint == "after_correction":
+    # Only credential problems block authenticated traffic; other ``after_correction`` errors (for
+    # example ``provenance_conflict``) concern one payload and are classified by status below.
+    if st in (401, 403) or code in ("invalid_credentials", "forbidden_ability"):
         return Outcome(AUTH, st, None, error_code=code or "unauthorized", **extra)
     if hint == "after_clock_sync":
         return Outcome(AFTER_CLOCK_SYNC, st, None, error_code=code, **extra)

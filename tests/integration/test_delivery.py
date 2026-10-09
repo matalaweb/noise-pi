@@ -11,7 +11,7 @@ import pytest
 from conftest import START_UTC, engine_scenario
 from noise_collector.acquisition.durability import record_config_ack
 from noise_collector.acquisition.replay import replay
-from noise_collector.contract.examples import configuration_result, example_configuration, reseal
+from noise_collector.contract.examples import CALIBRATION_IDS, PROFILE_IDS, configuration_result, example_configuration, reseal
 from noise_collector.delivery import retention
 from noise_collector.evidence.fsutil import resolve
 from noise_collector.store.db import connect
@@ -170,10 +170,39 @@ def test_unknown_provenance_refreshes_configuration_then_retries(env):
     srv.inject("batches", "code:unknown_provenance")
     svc.control_step(conn)
     row = conn.execute("SELECT * FROM outbox_batches ORDER BY first_second LIMIT 1").fetchone()
-    assert row["state"] == "pending" and row["last_error"] == "unknown_provenance" and row["next_attempt_at"] >= clock.t + 299
+    assert row["state"] == "pending" and row["last_error"] == "unknown_provenance" and row["next_attempt_at"] >= clock.t + 29
+    # the measurement chain is registered again (idempotent) before the batch is resubmitted
+    assert conn.execute("SELECT COUNT(*) FROM provenance_records WHERE state='pending'").fetchone()[0] == 2
+    clock.advance(31)
+    svc.control_step(conn)
     calls = [p for _, p in srv.log]
     post = calls.index("/api/v1/device/measurements/batches")
-    assert "/api/v1/device/configuration" in calls[post + 1:]  # configuration refetched right after the rejection
+    assert calls[post + 1:].count("/api/v1/device/provenance") == 1
+    assert conn.execute("SELECT state FROM outbox_batches WHERE batch_id=?", (row["batch_id"],)).fetchone()[0] == "acknowledged"
+
+
+def test_measurements_wait_for_chain_registration(env):
+    svc, conn, clock, srv = env
+    srv.inject("provenance", "http_503")
+    svc.control_step(conn)
+    calls = [p for _, p in srv.log]
+    assert "/api/v1/device/provenance" in calls and "/api/v1/device/measurements/batches" not in calls
+    assert "/api/v1/device/events" not in calls
+    clock.advance(120)
+    svc.control_step(conn)
+    assert set(srv.profiles) == {PROFILE_IDS["calibrated"]} and set(srv.calibrations) == {CALIBRATION_IDS["calibrated"]}
+    assert srv.batches  # sent once registered
+    assert svc.lane_errors["provenance_last"] == "registered"
+
+
+def test_conflicting_chain_registration_blocks_and_is_reported(env):
+    svc, conn, clock, srv = env
+    srv.profiles[PROFILE_IDS["calibrated"]] = ("other", {"channel": "mic-1"})
+    svc.control_step(conn)
+    st = svc.lane_errors["provenance_last"]
+    assert st == "rejected:provenance_conflict" and not srv.batches
+    summary = __import__("noise_collector.delivery.provenance", fromlist=["summary"]).summary(conn)
+    assert summary["rejected"] == 2 and "provenance_conflict" in summary["last_rejection"]
 
 
 def test_clock_future_rejection_holds_data(env):
@@ -354,29 +383,3 @@ def test_24h_outage_then_full_recovery_without_duplicates(env):
     assert states(conn, "measurements").get("acknowledged") == pending
     assert len(srv.records) == pending
     assert conn.execute("SELECT delivery_state FROM recordings").fetchone()[0] == "verified"
-
-
-def test_configuration_downloads_and_verifies_calibration_file(env):
-    import hashlib
-
-    svc, conn, clock, srv = env
-    umik = b'"Sens Factor =-0.7dB, AGain =18dB, SERNO: 7103946"\n10.0\t-1.7\n1000.0\t0.0\n20000.0\t-1.5\n'
-    att_id = "019a0f3d-7e7e-7000-8000-00000000c41f"
-    cal_id = "0e745c21-fc8f-40da-9113-7a158c913fc6"
-    att = {"id": att_id, "purpose": "frequency_response", "filename": "7103946_90deg.txt", "byte_size": len(umik),
-           "sha256": hashlib.sha256(umik).hexdigest(), "download_path": f"/api/v1/device/calibrations/{cal_id}/attachments/{att_id}"}
-    srv.config_result = configuration_result(5, calibration_extra={"sensitivity_dbfs_at_94db": -25.3, "attachments": [att]})
-    srv.config_result["provenance"]["measurement_profiles"][0]["microphone_serial"] = "7103946"
-    srv.inject("attachment", "http_503")
-    svc._poll_config(conn)
-    assert svc.lane_errors["config_last"].startswith("asset_retry")  # transient: retried, nothing staged
-    srv.files[att_id] = umik + b"tampered"
-    svc._poll_config(conn)
-    assert conn.execute("SELECT state, reason_code FROM configurations WHERE revision=5").fetchone()[:] == ("rejected", "asset_hash_mismatch")
-    srv.config_result = configuration_result(6, calibration_extra={"sensitivity_dbfs_at_94db": -25.3, "attachments": [att]})
-    srv.config_result["provenance"]["measurement_profiles"][0]["microphone_serial"] = "7103946"
-    srv.files[att_id] = umik
-    svc._poll_config(conn)
-    assert conn.execute("SELECT state FROM configurations WHERE revision=6").fetchone()[0] == "staged"
-    assert (svc.s.state_dir / "profiles" / att["sha256"]).read_bytes() == umik
-    assert srv.schema_violations == []

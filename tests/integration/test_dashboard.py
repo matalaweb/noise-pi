@@ -117,6 +117,59 @@ def test_lan_binding_requires_token(make_settings, tmp_path):
         srv.shutdown()
 
 
+def test_lan_without_token_only_by_explicit_opt_in(make_settings):
+    s = make_settings(dashboard={"bind": "0.0.0.0", "port": 0, "allow_unauthenticated_lan": True})
+    srv = DashboardServer(s)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        assert get(srv, "/api/status")[0].status == 200
+        assert get(srv, "/api/measurements", method="POST")[0].status == 405  # still read-only
+        assert get(srv, "/recordings/x.wav")[0].status == 404  # still never audio
+    finally:
+        srv.shutdown()
+
+
+def test_stop_event_control(make_settings, monkeypatch):
+    import json as _json
+    import urllib.request
+
+    from noise_collector.health.control import take_stop_event_request
+
+    s = make_settings(dashboard={"port": 0})
+    monkeypatch.setenv("NOISE_COLLECTOR_RUN_DIR", str(s.state_dir / "run"))
+    eid = "75be624a-d2a5-4fee-989b-70ba93d7f381"
+    (s.state_dir / "run").mkdir(parents=True, exist_ok=True)
+    (s.state_dir / "run" / "acquisition-status.json").write_text(_json.dumps({"engine": {"detection": {"state": "active", "event_id": eid}}}))
+
+    def post(srv, path, header=True):
+        req = urllib.request.Request(f"http://{srv.address[0]}:{srv.address[1]}{path}", method="POST",
+                                     headers={"X-Noise-Collector": "stop-event"} if header else {})
+        try:
+            return urllib.request.urlopen(req, timeout=5).status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    off = DashboardServer(s)
+    threading.Thread(target=off.serve_forever, daemon=True).start()
+    try:
+        assert post(off, f"/api/events/{eid}/stop") == 405  # off by default: read-only
+    finally:
+        off.shutdown()
+    s = make_settings(dashboard={"port": 0, "allow_stop_event": True})
+    srv = DashboardServer(s)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        assert _json.loads(get(srv, "/api/status")[1])["controls"] == {"stop_event": True}
+        assert post(srv, f"/api/events/{eid}/stop", header=False) == 403  # cross-site forms cannot set it
+        assert post(srv, "/api/events/00000000-0000-4000-8000-000000000000/stop") == 409
+        assert post(srv, "/api/measurements") == 405  # still the only write
+        assert take_stop_event_request(s.state_dir) is None
+        assert post(srv, f"/api/events/{eid}/stop") == 202
+        assert take_stop_event_request(s.state_dir) == eid
+    finally:
+        srv.shutdown()
+
+
 def test_downsampling_is_max_preserving():
     from noise_collector.dashboard.server import _downsample
 

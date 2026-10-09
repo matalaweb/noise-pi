@@ -2,9 +2,12 @@
 
 * Separate process; reads SQLite through a read-only connection and the runtime status files,
   so it cannot block or alter capture, storage or delivery.
+* Read-only, except one optional owner control (``allow_stop_event``): ``POST
+  /api/events/<id>/stop`` drops a request the acquisition process acts on (health/control.py).
 * Binds to loopback by default (reach it through an SSH tunnel). Binding any other address
   requires an access token file; requests then need ``Authorization: Bearer <token>`` or a
-  one-time ``?token=`` that sets an HttpOnly, SameSite=Strict cookie.
+  one-time ``?token=`` that sets an HttpOnly, SameSite=Strict cookie. The owner may opt out
+  explicitly with ``allow_unauthenticated_lan`` (trusted private network only).
 * Live updates: Server-Sent Events push every newly committed one-second measurement (1 Hz, the
   instrument's measurement resolution) together with detector/microphone state.
 * No third-party assets: the page is self-contained (strict CSP), so it works on a LAN without
@@ -17,6 +20,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import re
 import secrets
 import sqlite3
 import threading
@@ -28,10 +32,12 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from ..config.settings import Settings
+from ..health.control import request_stop_event
 from ..health.status import read_status, run_dir
 from ..store.db import connect
 
 log = logging.getLogger(__name__)
+STOP_PATH = re.compile(r"/api/events/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/stop")
 
 METRICS = ("laeq_db", "lafmax_db", "lceq_db", "low_frequency_leq_db", "rms_dbfs")
 MAX_HISTORY_SECONDS = 7 * 86400
@@ -183,6 +189,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "noise-collector-dashboard"
     data: DataSource
     token: str | None
+    allow_stop_event: bool = False
     sse_interval: float = 1.0
 
     def log_message(self, fmt: str, *args) -> None:  # keep logs bounded and token-free
@@ -236,7 +243,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self._send(200, _page(), "text/html; charset=utf-8")
             elif u.path == "/api/status":
-                self._json(self.data.status(), extra)
+                self._json({**self.data.status(), "controls": {"stop_event": self.allow_stop_event}}, extra)
             elif u.path == "/api/measurements":
                 latest = self.data.latest_second() or int(time.time())
                 seconds = min(MAX_HISTORY_SECONDS, max(60, int(q.get("seconds", ["600"])[0])))
@@ -254,10 +261,37 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             self._send(HTTPStatus.BAD_REQUEST, b"bad request", "text/plain")
 
-    def do_POST(self) -> None:  # noqa: N802 - read-only by design
+    def do_POST(self) -> None:  # noqa: N802
+        """The only write: ``POST /api/events/<id>/stop`` when ``allow_stop_event`` is on."""
+        u = urlparse(self.path)
+        m = STOP_PATH.fullmatch(u.path)
+        if not (self.allow_stop_event and m):
+            self._read_only()
+            return
+        ok, _ = self._authorized({})
+        if not ok:
+            self._send(HTTPStatus.UNAUTHORIZED, b"unauthorized", "text/plain", {"WWW-Authenticate": "Bearer"})
+            return
+        # A custom header cannot be sent cross-site without a CORS preflight this server never grants,
+        # so other web pages open in the owner's browser cannot trigger the stop.
+        if self.headers.get("X-Noise-Collector") != "stop-event":
+            self._send(HTTPStatus.FORBIDDEN, b"missing X-Noise-Collector header", "text/plain")
+            return
+        event_id = m.group(1)
+        if (self.data.status().get("detection") or {}).get("event_id") != event_id:
+            self._send(HTTPStatus.CONFLICT, json.dumps({"error": "not the open event"}).encode(), "application/json")
+            return
+        request_stop_event(self.data.state_dir, event_id)
+        log.info("owner requested stop of event %s from %s", event_id, self.address_string())
+        self._send(HTTPStatus.ACCEPTED, json.dumps({"event_id": event_id, "status": "stop requested"}).encode(), "application/json")
+
+    def _read_only(self) -> None:
         self._send(HTTPStatus.METHOD_NOT_ALLOWED, b"read-only", "text/plain", {"Allow": "GET"})
 
-    do_PUT = do_DELETE = do_PATCH = do_POST  # noqa: N815
+    def do_PUT(self) -> None:  # noqa: N802
+        self._read_only()
+
+    do_DELETE = do_PATCH = do_PUT  # noqa: N815
 
     def _stream(self, since: int) -> None:
         self.send_response(200)
@@ -276,7 +310,8 @@ class Handler(BaseHTTPRequestHandler):
             now = time.monotonic()
             if now - last_status >= 1.0:
                 last_status = now
-                self.wfile.write(f"event: status\ndata: {json.dumps(self.data.status(), default=str)}\n\n".encode())
+                status = {**self.data.status(), "controls": {"stop_event": self.allow_stop_event}}
+                self.wfile.write(f"event: status\ndata: {json.dumps(status, default=str)}\n\n".encode())
             self.wfile.flush()
             stop.wait(self.sse_interval)
 
@@ -292,8 +327,13 @@ class DashboardServer:
             if len(token) < 24:
                 raise DashboardError("dashboard access token must be at least 24 characters")
         if not _is_loopback(self.host) and token is None:
-            raise DashboardError(f"refusing to bind {self.host} without dashboard.access_token_file (no unauthenticated LAN endpoint)")
-        handler = type("BoundHandler", (Handler,), {"data": DataSource(settings.db_path, settings.state_dir), "token": token})
+            if not d.allow_unauthenticated_lan:
+                raise DashboardError(f"refusing to bind {self.host} without dashboard.access_token_file "
+                                     "(or an explicit dashboard.allow_unauthenticated_lan = true)")
+            log.warning("dashboard bound to %s without an access token (allow_unauthenticated_lan): anyone on the network can view it",
+                        self.host)
+        handler = type("BoundHandler", (Handler,), {"data": DataSource(settings.db_path, settings.state_dir), "token": token,
+                                                    "allow_stop_event": d.allow_stop_event})
         self.httpd = ThreadingHTTPServer((self.host, self.port), handler)
         self.httpd.daemon_threads = True
         self.httpd.stop_event = threading.Event()  # type: ignore[attr-defined]

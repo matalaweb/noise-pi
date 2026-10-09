@@ -6,7 +6,8 @@
 # What this changes (and nothing else):
 #   * apt packages: python3-venv libportaudio2 libsndfile1 alsa-utils chrony
 #   * system user/group 'noise-collector' (member of 'audio'), no login shell
-#   * /opt/noise-collector/{venv,docs} (code; replaced on upgrade)
+#   * /opt/noise-collector/releases/<time>/ (a new venv per install), venv -> current release,
+#     previous -> prior release, docs (replaced on upgrade)
 #   * /etc/noise-collector/ (created 0750 if missing; existing files are left alone)
 #   * /etc/systemd/system/noise-collector.service
 # Data under /var/lib/noise-collector is never modified by this script.
@@ -34,16 +35,28 @@ if ! id "$USER_NAME" >/dev/null 2>&1; then
 fi
 usermod -a -G audio "$USER_NAME"
 
-install -d -m 0755 "$PREFIX"
-rm -rf "$PREFIX/venv.new"
-"$PY" -m venv "$PREFIX/venv.new"
-"$PREFIX/venv.new/bin/pip" install --quiet --upgrade pip
+install -d -m 0755 "$PREFIX" "$PREFIX/releases"
+# Virtualenvs are not relocatable (scripts embed absolute interpreter paths), so each install
+# builds a new venv in its final place, releases/<timestamp>, and then atomically repoints the
+# $PREFIX/venv symlink. The previous release stays for rollback.
+REL="$PREFIX/releases/$(date -u +%Y%m%dT%H%M%SZ)"
+"$PY" -m venv "$REL"
+"$REL/bin/pip" install --quiet --upgrade pip
 # Locked, hash-checked dependencies; then the collector itself without re-resolving deps.
-"$PREFIX/venv.new/bin/pip" install --quiet --require-hashes -r "$SRC/requirements.lock"
-"$PREFIX/venv.new/bin/pip" install --quiet --no-deps "$SRC"
-"$PREFIX/venv.new/bin/noise-collector" --version
-if [[ -d "$PREFIX/venv" ]]; then rm -rf "$PREFIX/venv.prev"; mv "$PREFIX/venv" "$PREFIX/venv.prev"; fi
-mv "$PREFIX/venv.new" "$PREFIX/venv"
+"$REL/bin/pip" install --quiet --require-hashes -r "$SRC/requirements.lock"
+"$REL/bin/pip" install --quiet --no-deps "$SRC"
+"$REL/bin/noise-collector" --version
+if [[ -d "$PREFIX/venv" && ! -L "$PREFIX/venv" ]]; then
+  # Layout from earlier installers (a real directory): keep it aside, never delete it here.
+  rm -rf "$PREFIX/venv.legacy"; mv "$PREFIX/venv" "$PREFIX/venv.legacy"
+fi
+if [[ -L "$PREFIX/venv" ]]; then ln -sfn "$(readlink "$PREFIX/venv")" "$PREFIX/previous"; fi
+ln -sfn "$REL" "$PREFIX/venv.next" && mv -T "$PREFIX/venv.next" "$PREFIX/venv"
+# Keep the three newest releases plus whatever "previous" points to.
+KEEP_PREV="$(readlink -f "$PREFIX/previous" 2>/dev/null || true)"
+ls -1dt "$PREFIX"/releases/*/ 2>/dev/null | tail -n +4 | while read -r old; do
+  [[ "$(readlink -f "$old")" == "$KEEP_PREV" ]] || rm -rf "$old"
+done
 rm -rf "$PREFIX/docs"; cp -r "$SRC/docs" "$PREFIX/docs"
 
 install -d -m 0750 -o root -g "$USER_NAME" "$ETC"
@@ -65,4 +78,4 @@ echo "  2. sudo -u $USER_NAME $PREFIX/venv/bin/noise-collector devices"
 echo "  3. sudo -u $USER_NAME $PREFIX/venv/bin/noise-collector provision --bootstrap bootstrap.toml --output $ETC/collector.toml --yes"
 echo "  4. sudo -u $USER_NAME $PREFIX/venv/bin/noise-collector doctor"
 echo "  5. sudo systemctl enable --now noise-collector"
-echo "rollback: sudo systemctl stop noise-collector && sudo mv $PREFIX/venv $PREFIX/venv.bad && sudo mv $PREFIX/venv.prev $PREFIX/venv (see docs/operations.md: schema compatibility)"
+echo "rollback: sudo systemctl stop noise-collector && sudo ln -sfn \"\$(readlink $PREFIX/previous)\" $PREFIX/venv && sudo systemctl start noise-collector (see docs/operations.md: schema compatibility)"

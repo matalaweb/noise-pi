@@ -1,0 +1,18 @@
+{
+  "request_id": "019a0f3d-5f6a-7cad-9e1f-2a3b4c5d6e70",
+  "server_received_at": "2026-10-08T12:15:00.000Z",
+  "measurement_profiles": [
+    {
+      "id": "019a0f3d-1a2b-7c3d-8e4f-5a6b7c8d9e01",
+      "revision": 1,
+      "status": "created"
+    }
+  ],
+  "calibrations": [
+    {
+      "id": "019a0f3d-1a2b-7c3d-8e4f-5a6b7c8d9e02",
+      "revision": 1,
+      "status": "created"
+    }
+  ]
+}

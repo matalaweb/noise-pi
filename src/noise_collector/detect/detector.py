@@ -13,6 +13,10 @@ States: ``warming`` (an enabled relative rule has no baseline yet), ``idle``, ``
   it, so the quiet seconds are part of the post-roll.
 * A retrigger (a rule completing its run against the frozen thresholds) before post-roll ends
   continues the same event. A data loss while active terminates the event as incomplete.
+* An event still active ``max_event_seconds`` after its first qualifying second ends there
+  (reason ``max_duration``, no post-roll), and the baselines are cleared so they re-learn the new
+  level: a lasting shift (door left open) stops being an event once re-learnt, while sound above
+  an absolute threshold starts a new event.
 * Baselines only take complete, unclipped intervals that qualify no rule while idle/warming
   and outside the post-event recovery period.
 
@@ -116,6 +120,7 @@ class _Frozen:
     thresholds: dict[str, float]
     baseline: dict
     settings: DetectionSettings
+    start_second: int = 0
 
 
 @dataclass
@@ -245,7 +250,8 @@ class Detector:
             thr = thresholds[rule.id]
             assert thr is not None
             evaluable = {r.id: t for r, t in ((r, thresholds[r.id]) for r in self.rules) if t is not None}
-            self.frozen = _Frozen(rules=list(self.rules), thresholds=evaluable, baseline=snapshot, settings=self.settings)
+            self.frozen = _Frozen(rules=list(self.rules), thresholds=evaluable, baseline=snapshot, settings=self.settings,
+                                  start_second=start)
             self.state = ACTIVE
             self.quiet_len = 0
             actions.append(
@@ -300,6 +306,9 @@ class Detector:
 
     def _evaluate_active(self, iv: DetectorInterval) -> list[Action]:
         k = iv.second
+        assert self.frozen is not None
+        if k + 1 - self.frozen.start_second >= self.frozen.settings.max_event_seconds:
+            return self._end_at_max_duration(k)
         if self._quiet(iv):
             if self.quiet_len == 0:
                 self.quiet_start = k
@@ -339,6 +348,28 @@ class Detector:
         self.recovery_until = self.post_roll_end + self.settings.baseline.recovery_seconds
         self._settle(k)
         return [end]
+
+    def _end_at_max_duration(self, k: int) -> list[Action]:
+        return self._end_now(k, "max_duration")
+
+    def _end_now(self, k: int, reason: str) -> list[Action]:
+        """End the event at the end of interval ``k`` (no post-roll) and re-learn the baselines."""
+        end = EventEnd(k + 1, k + 1, reason=reason)
+        self.reset_baselines()
+        self.recovery_until = k + 1  # learn the current level right away
+        self._settle(k)
+        return [end]
+
+    def force_end(self, k: int) -> list[Action]:
+        """Owner stop after interval ``k``. Active: end now (the sound may continue; baselines are
+        re-learnt). Post-roll: the detection end is already known; only the post-roll is cut."""
+        if self.state == ACTIVE:
+            return self._end_now(k, "operator_stop")
+        if self.state == POST_ROLL:
+            assert self.provisional_end is not None
+            self.post_roll_end = k + 1
+            return self._finish(k, reason="operator_stop_post_roll")
+        return []
 
     def on_data_loss(self, k: int, reason: str) -> list[Action]:
         """Interval ``k`` (or a stream stop/split at ``k``) was not observed."""

@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "sent_at": "2026-10-08T12:14:58.000Z",
+  "measurement_profiles": [
+    {
+      "id": "019a0f3d-1a2b-7c3d-8e4f-5a6b7c8d9e01",
+      "channel": "mic-1",
+      "name": null,
+      "microphone_model": "miniDSP UMIK-1",
+      "microphone_serial": "7213485",
+      "audio_interface": "USB (built-in)",
+      "sample_rate_hz": 48000,
+      "gain_db": null,
+      "gain_description": "UMIK-1 analog 18 dB; ALSA Mic 0.00 dB",
+      "weighting_implementation_version": "noise-collector A/C v1 A:3f2a91c0 C:8be1d4f7",
+      "filter_implementation_version": "noise-collector LF v1 20-125 Hz:5c09ae12",
+      "agent_processing_version": "noise-collector 0.2.0",
+      "calibration_state": "estimated",
+      "calibration_application_method": "sensitivity offset dBFS->SPL; min-phase FIR frequency-response correction (0 dB at 1 kHz)",
+      "supported_metrics": [
+        "laeq_db",
+        "lafmax_db",
+        "lceq_db",
+        "low_frequency_leq_db",
+        "rms_dbfs"
+      ],
+      "low_frequency_lower_hz": 20,
+      "low_frequency_upper_hz": 125,
+      "band_centers_hz": []
+    }
+  ],
+  "calibrations": [
+    {
+      "id": "019a0f3d-1a2b-7c3d-8e4f-5a6b7c8d9e02",
+      "channel": "mic-1",
+      "calibration_state": "estimated",
+      "reference_method": "UMIK-1 calibration file Sens Factor (REW convention)",
+      "reference_device": null,
+      "reference_level_db": 94,
+      "reference_frequency_hz": 1000,
+      "sensitivity_mv_per_pa": null,
+      "sensitivity_dbfs_at_94db": -30.082,
+      "gain_configuration": "UMIK-1 analog 18 dB; ALSA Mic 0.00 dB",
+      "application_method": "sensitivity offset dBFS->SPL; min-phase FIR frequency-response correction (0 dB at 1 kHz)",
+      "performed_at": null,
+      "performed_by": null,
+      "notes": null,
+      "attachments": [
+        {
+          "purpose": "frequency_response",
+          "filename": "7213485_90deg.txt",
+          "media_type": "text/plain",
+          "sha256": "38cc95904fe50dcba96f10a5eccbdcf1753c8e808219b8a694cde3241c5663c0",
+          "content_base64": "IlNlbnMgRmFjdG9yID0tMC4wODJkQiwgQUdhaW4gPTE4ZEIsIFNFUk5POiA3MjEzNDg1IgoxMC4wNTQJLTEuNzAKMjAuMDAwCS0wLjYyCjEwMDAuMDAwCTAuMDAKMTAwMDAuMDAwCTEuMjEKMjAwMDAuMDAwCS0yLjg0Cg=="
+        }
+      ]
+    }
+  ]
+}

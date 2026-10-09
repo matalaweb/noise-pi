@@ -39,6 +39,7 @@ def replay(
     synchronized: bool = True,
     rate_ppm: float = 0.0,
     id_factory=None,
+    provenance_records: tuple[dict, ...] | None = None,
     audio_allowed=None,
 ) -> ReplayResult:
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -46,6 +47,11 @@ def replay(
     migrate(db)
     conn = connect(db)
     recover(conn, state_dir)
+    # Like the acquisition process: queue the measurement chain for registration with the server.
+    from ..config.chain import LocalChain, store_records
+    from ..contract.examples import example_records
+
+    store_records(conn, LocalChain(profile=config.profile, records=provenance_records or example_records(config.profile)))
     clock = SimulatedClock(start_utc - 1000.0, synchronized=synchronized)
     src = FileSource(path, start_utc=start_utc, block_pattern=block_pattern, seed=seed, faults=faults, clock=clock, rate_ppm=rate_ppm)
     local = local or EngineLocalSettings(timing=TimingSettings(require_clock_sync=True))

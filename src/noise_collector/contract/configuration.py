@@ -6,9 +6,14 @@ Authoritative contract: ``contract/upstream/device-api-v1.yaml`` (Laravel ``docs
   order recursively, list order preserved, no whitespace, unescaped ``/`` and Unicode, floats in
   PHP's shortest round-trip form with a preserved ``.0`` (PHP exponent spelling), and empty
   objects/arrays both encoded as ``[]`` (PHP cannot tell them apart after decoding).
-* ``translate`` turns the server document + provenance + owner-controlled local inputs into the
-  ``DeviceConfiguration`` the engine runs. Anything the collector cannot honour raises
-  ``ConfigRejected`` so the previous valid configuration stays active and a rejection is acknowledged.
+* The server document carries operational settings only (intervals, recording, detection,
+  retention, enabled metrics). The measurement chain (profile + calibration) is built locally
+  (``config/chain.py``) and registered with the server; see contract/device-reported-provenance.md.
+* ``parse_document`` validates a server document against owner-controlled local inputs; anything
+  the collector cannot honour raises ``ConfigRejected`` so the previous configuration stays active
+  and a rejection is acknowledged. ``local_defaults`` is what runs before any configuration is
+  published. ``effective`` combines either with the local profile into the ``DeviceConfiguration``
+  the engine runs.
 """
 
 from __future__ import annotations
@@ -17,7 +22,6 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -125,14 +129,12 @@ class Server(BaseModel):
 
 
 class ChannelEntry(Server):
+    # Older revisions also carry measurement_profile_id / deployment_id / calibration_id /
+    # calibration_state; they are ignored (the device reports its own chain).
     channel: str
     enabled: bool = True
     metrics: list[str] = Field(default_factory=list)
     bands_enabled: bool = False
-    measurement_profile_id: str | None
-    deployment_id: str | None
-    calibration_id: str | None = None
-    calibration_state: Literal["uncalibrated", "estimated", "calibrated"] | None = None
 
 
 class RecordingDoc(Server):
@@ -162,6 +164,7 @@ class DetectionDoc(Server):
     baseline_relative: RelativeRuleDoc = RelativeRuleDoc()
     min_event_duration_ms: int = 1000
     merge_gap_ms: int = 5000
+    max_event_duration_seconds: int = 600
     observation_period_until: str | None = None
 
 
@@ -184,74 +187,12 @@ class ConfigurationDocument(Server):
     local_retention: RetentionDoc = RetentionDoc()
 
 
-class ProvProfile(Server):
-    id: str
-    channel: str
-    revision: int
-    calibration_state: Literal["uncalibrated", "estimated", "calibrated"]
-    microphone_model: str | None = None
-    microphone_serial: str | None = None
-    audio_interface: str | None = None
-    gain_description: str | None = None
-    supported_metrics: list[str]
-    sample_rate_hz: int
-    gain_db: float | None = None
-    low_frequency_band_hz: list[float] | None = None
-    band_definitions: Any = None
-    content_hash: str
-
-
-class ProvDeployment(Server):
-    id: str
-    revision: int
-    effective_at: str
-    content_hash: str
-
-
-class ProvAttachment(Server):
-    id: str
-    purpose: str
-    filename: str
-    byte_size: int
-    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    download_path: str
-
-
-class ProvCalibration(Server):
-    id: str
-    channel: str
-    revision: int
-    calibration_state: Literal["estimated", "calibrated"]
-    content_hash: str
-    reference_method: str | None = None
-    reference_device: str | None = None
-    sensitivity_dbfs_at_94db: float | None = None
-    sensitivity_mv_per_pa: float | None = None
-    reference_level_db: float | None = None
-    reference_frequency_hz: float | None = None
-    gain_configuration: str | None = None
-    application_method: str | None = None
-    correction_metadata: Any = None
-    performed_at: str | None = None
-    attachments: list[ProvAttachment] = Field(default_factory=list)
-
-    def frequency_response_files(self) -> list[ProvAttachment]:
-        return [a for a in self.attachments if a.purpose == "frequency_response"]
-
-
-class Provenance(Server):
-    measurement_profiles: list[ProvProfile] = Field(default_factory=list)
-    deployments: list[ProvDeployment] = Field(default_factory=list)
-    calibrations: list[ProvCalibration] = Field(default_factory=list)
-
-
 class ConfigurationResult(Server):
     revision: int
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     issued_at: str
     applied_revision: int | None = None
     configuration: dict
-    provenance: Provenance = Provenance()
 
 
 # ---------------------------------------------------------------------------- effective configuration
@@ -359,6 +300,10 @@ class DetectionSettings(Eff):
     quiet_seconds: int = Field(default=5, ge=1, le=120)
     rules: list[Rule] = Field(default_factory=_default_rules)
     observation_period_until: str | None = None
+    # An event still above threshold after this long is ended (``max_duration_reached``) and the
+    # baselines are re-learnt, so a lasting level shift (door left open, a fan) cannot keep one
+    # event and its recording open indefinitely.
+    max_event_seconds: int = Field(default=600, ge=60, le=14400)
 
 
 class RecordingSettings(Eff):
@@ -385,45 +330,40 @@ class RetentionSettings(Eff):
     max_disk_usage_percent: int = 80
 
 
-class DeviceConfiguration(Eff):
-    """What the engine runs. Built only by ``translate`` (or test helpers that call it)."""
+class Operational(Eff):
+    """Operational settings from a server document, or the local defaults (``revision`` None)."""
 
-    revision: int = Field(ge=1)
-    sha256: str
-    issued_at: str
+    revision: int | None = Field(default=None, ge=1)
+    sha256: str | None = None
+    issued_at: str | None = None
     device_id: str = ""
-    deployment_id: str
-    deployment_content_hash: str = ""
     channel: str
     configured_metrics: tuple[str, ...] = METRICS
-    profile: Profile
     detection: DetectionSettings = DetectionSettings()
     recording: RecordingSettings = RecordingSettings()
     delivery: DeliverySettings = DeliverySettings()
     retention: RetentionSettings = RetentionSettings()
     notes: tuple[str, ...] = ()
 
+    @property
+    def is_local_defaults(self) -> bool:
+        return self.revision is None
+
+
+class DeviceConfiguration(Operational):
+    """What the engine runs: operational settings plus the locally built measurement profile."""
+
+    profile: Profile
+
     def reports(self, metric: str) -> bool:
         return metric in self.configured_metrics and metric in self.profile.supported_metrics
 
+    @property
+    def operational(self) -> Operational:
+        return Operational.model_validate({k: getattr(self, k) for k in Operational.model_fields})
+
 
 # ---------------------------------------------------------------------------- translation
-
-
-@dataclass
-class LocalCalibration:
-    """Owner-provided absolute scale for one server calibration revision."""
-
-    calibration_id: str
-    content_hash: str
-    pa_per_fs: float | None = None
-    sensitivity_dbfs_at_94db: float | None = None
-    method: str = "manufacturer_sensitivity"
-    response_curve: tuple[tuple[float, float], ...] | None = None
-    curve_is: str = "microphone_response"
-    curve_sha256: str | None = None
-    noise_floor_laeq_db: float | None = None
-    noise_floor_method: str | None = None
 
 
 @dataclass
@@ -432,108 +372,44 @@ class LocalInputs:
     capture: CaptureSpec
     expected_gain_controls: dict[str, str] = field(default_factory=dict)
     gain_reference_check: str | None = None
-    calibrations: dict[str, LocalCalibration] = field(default_factory=dict)
     max_ack_retention_days: float = 30.0
     max_audio_retention_days: float = 30.0
-    # Downloaded calibration files (frequency_response attachments) by sha256.
-    asset_dir: "Path | None" = None
-    # Which serial-specific file to use when a calibration carries several (UMIK-1: 0deg / 90deg).
-    calibration_orientation: str | None = None
-    usb_serial: str | None = None
     # The microphone model's gain is read back and verified by built-in rules (UMIK-1 preset).
     builtin_gain_check: bool = False
     acknowledged_retention_days: float | None = None
     verified_audio_retention_hours: float | None = None
+    recording_locally_enabled: bool = True
 
 
-def _scale_from(cal: ProvCalibration, local: LocalCalibration | None) -> tuple[ScaleSpec | None, str | None]:
-    from ..dsp.calibration import scale_from_sensitivity
-
-    if cal.sensitivity_dbfs_at_94db is not None:
-        return ScaleSpec(method="server_sensitivity", pa_per_fs=scale_from_sensitivity(cal.sensitivity_dbfs_at_94db, 94.0),
-                         source=f"server calibration {cal.id} r{cal.revision}"), None
-    if local is None:
-        return None, f"no absolute scale for calibration {cal.id}: SPL fields stay null (add it to calibrations.toml)"
-    if local.content_hash != cal.content_hash:
-        return None, f"calibrations.toml entry for {cal.id} is pinned to a different calibration revision; SPL fields stay null"
-    if local.pa_per_fs is not None:
-        pa = local.pa_per_fs
-    elif local.sensitivity_dbfs_at_94db is not None:
-        pa = scale_from_sensitivity(local.sensitivity_dbfs_at_94db, 94.0)
-    else:
-        return None, f"calibrations.toml entry for {cal.id} has no scale"
-    method = local.method if local.method in ("manufacturer_sensitivity", "reference_measurement", "comparison_estimate") else "manufacturer_sensitivity"
-    if cal.calibration_state == "calibrated" and method == "comparison_estimate":
-        return None, "a comparison estimate cannot back a calibrated profile"
-    return ScaleSpec(method=method, pa_per_fs=pa, source=f"local calibrations.toml for {cal.id}"), None
-
-
-def _header_db(value: str | None) -> float | None:
-    from ..audio.umik1 import _db
-
-    return _db(value)
-
-
-def _pick_response_file(cal: ProvCalibration, local: LocalInputs, notes: list[str]) -> ProvAttachment | None:
-    files = cal.frequency_response_files()
-    if not files:
-        return None
-    if len(files) == 1:
-        return files[0]
-    from ..audio.umik1 import is_ninety_degree_file
-
-    want = (local.calibration_orientation or "").lower()
-    if want in ("90deg", "0deg"):
-        matches = [f for f in files if is_ninety_degree_file(f.filename) == (want == "90deg")]
-        if len(matches) == 1:
-            return matches[0]
-    notes.append(f"calibration {cal.id} has {len(files)} frequency-response files; set [microphone] calibration_orientation "
-                 "('0deg' or '90deg') to choose one; no response correction applied")
-    return None
-
-
-def _server_response_correction(cal: ProvCalibration, prof: ProvProfile, local: LocalInputs,
-                                notes: list[str], header_out: dict | None = None) -> ResponseCorrectionSpec | None:
-    """Response correction from the calibration's frequency-response attachment (e.g. a UMIK-1 file)."""
-    from ..dsp.calibration import parse_calibration_file
-
-    meta = cal.correction_metadata if isinstance(cal.correction_metadata, dict) else {}
-    if str(meta.get("apply_frequency_response", "true")).lower() in ("false", "0", "no"):
-        if cal.frequency_response_files():
-            notes.append("frequency-response file present but correction_metadata.apply_frequency_response is false")
-        return None
-    chosen = _pick_response_file(cal, local, notes)
-    if chosen is None:
-        return None
-    path = Path(local.asset_dir) / chosen.sha256 if local.asset_dir else None
-    if path is None or not path.exists():
-        raise ConfigRejected("asset_unavailable", f"frequency-response file {chosen.filename} has not been downloaded")
-    data = path.read_bytes()
-    if hashlib.sha256(data).hexdigest() != chosen.sha256:
-        raise ConfigRejected("asset_hash_mismatch", chosen.filename)
-    try:
-        curve_file = parse_calibration_file(data)
-    except ValueError as exc:
-        raise ConfigRejected("invalid_calibration_file", f"{chosen.filename}: {exc}") from exc
-    if header_out is not None:
-        header_out.update(curve_file.header)
-    serno = curve_file.header.get("SERNO")
-    if serno and prof.microphone_serial and serno.strip() != prof.microphone_serial.strip():
-        raise ConfigRejected("calibration_serial_mismatch",
-                             f"{chosen.filename} is for serial {serno}, profile microphone serial is {prof.microphone_serial}")
-    curve_is = str(meta.get("curve_is", "microphone_response"))
-    if curve_is not in ("microphone_response", "correction"):
-        raise ConfigRejected("invalid_calibration_metadata", f"curve_is={curve_is!r}")
-    notes.append(f"response correction from {chosen.filename} (sha256 {chosen.sha256[:12]}...)")
-    return ResponseCorrectionSpec(
-        method="fir_min_phase_v1",
-        curve=tuple(zip(map(float, curve_file.freqs_hz), map(float, curve_file.response_db))),
-        curve_is=curve_is,  # type: ignore[arg-type]
-        source_sha256=chosen.sha256,
+def _retention(local: LocalInputs, measurement_days: float, audio_days: float, max_disk_percent: int) -> RetentionSettings:
+    return RetentionSettings(
+        acknowledged_measurement_days=min(float(measurement_days), local.max_ack_retention_days)
+        if local.acknowledged_retention_days is None else local.acknowledged_retention_days,
+        verified_audio_days=min(float(audio_days), local.max_audio_retention_days)
+        if local.verified_audio_retention_hours is None else local.verified_audio_retention_hours / 24,
+        max_disk_usage_percent=max(10, min(95, max_disk_percent)),
     )
 
 
-def translate(result: dict, local: LocalInputs, *, verify_hash: bool = True) -> DeviceConfiguration:
+def local_defaults(local: LocalInputs) -> Operational:
+    """Runs until a configuration is published: measurements only, no detection rules."""
+    doc = ConfigurationDocument.model_validate({"schema_version": 1, "device_id": "", "revision": 1, "channels": []})
+    rec = doc.recording
+    return Operational(
+        channel=local.channel,
+        configured_metrics=METRICS,
+        detection=DetectionSettings(rules=[]),
+        recording=RecordingSettings(enabled=local.recording_locally_enabled, pre_roll_seconds=rec.pre_roll_seconds,
+                                    post_roll_seconds=rec.post_roll_seconds, segment_max_seconds=rec.max_segment_duration_seconds,
+                                    container="flac"),
+        delivery=DeliverySettings(measurement_batch_seconds=doc.reporting_interval_seconds, heartbeat_seconds=doc.heartbeat_interval_seconds),
+        retention=_retention(local, doc.local_retention.measurement_days, doc.local_retention.audio_days,
+                             doc.local_retention.max_disk_usage_percent),
+        notes=("local defaults: no configuration published yet (measurements only, no detection rules)",),
+    )
+
+
+def parse_document(result: dict, local: LocalInputs, *, verify_hash: bool = True) -> Operational:
     try:
         res = ConfigurationResult.model_validate(result)
     except Exception as exc:  # pydantic ValidationError
@@ -554,70 +430,7 @@ def translate(result: dict, local: LocalInputs, *, verify_hash: bool = True) -> 
         raise ConfigRejected("channel_disabled", f"channel {local.channel!r} is disabled in this configuration")
     if ch.bands_enabled:
         raise ConfigRejected("unsupported_capability", "third-octave bands are not implemented by this collector")
-    prof = next((p for p in res.provenance.measurement_profiles if p.id == ch.measurement_profile_id), None)
-    dep = next((d for d in res.provenance.deployments if d.id == ch.deployment_id), None)
-    if prof is None or dep is None:
-        raise ConfigRejected("provenance_missing", "profile or deployment referenced by the channel is not in provenance")
-    if prof.channel != local.channel:
-        raise ConfigRejected("provenance_mismatch", "profile channel differs from the local channel")
-    if prof.microphone_serial and local.usb_serial and prof.microphone_serial.strip() != local.usb_serial.strip():
-        raise ConfigRejected("microphone_serial_mismatch",
-                             f"profile microphone serial {prof.microphone_serial} != local microphone serial {local.usb_serial}")
-    if prof.sample_rate_hz not in (44100, 48000, 96000):
-        raise ConfigRejected("unsupported_sample_rate", f"{prof.sample_rate_hz} Hz has no validated filter coefficients")
     notes: list[str] = []
-    scale = None
-    cal = None
-    if prof.calibration_state != "uncalibrated":
-        cal = next((c for c in res.provenance.calibrations if c.id == ch.calibration_id), None)
-        if cal is None or cal.calibration_state != prof.calibration_state or cal.channel != local.channel:
-            raise ConfigRejected("provenance_mismatch", "calibration missing or inconsistent with the profile")
-        lc = local.calibrations.get(cal.id)
-        scale, note = _scale_from(cal, lc)
-        if note:
-            notes.append(note)
-        if (prof.calibration_state == "calibrated" and not local.expected_gain_controls and not local.gain_reference_check
-                and not local.builtin_gain_check):
-            notes.append("calibrated profile without gain read-back or reference check: SPL withheld")
-            scale = None
-    elif ch.calibration_id is not None:
-        raise ConfigRejected("provenance_mismatch", "uncalibrated profile must not reference a calibration")
-    lc = local.calibrations.get(cal.id) if cal else None
-    correction = ResponseCorrectionSpec()
-    noise_floor = None
-    cal_header: dict[str, str] = {}
-    server_correction = _server_response_correction(cal, prof, local, notes, cal_header) if cal is not None else None
-    if server_correction is not None and scale is not None:
-        correction = server_correction
-    if lc is not None and scale is not None:
-        if lc.response_curve and server_correction is None:
-            correction = ResponseCorrectionSpec(method="fir_min_phase_v1", curve=lc.response_curve, curve_is=lc.curve_is,  # type: ignore[arg-type]
-                                                source_sha256=lc.curve_sha256)
-        if lc.noise_floor_laeq_db is not None and lc.noise_floor_method:
-            noise_floor = NoiseFloorSpec(laeq_db=lc.noise_floor_laeq_db, method=lc.noise_floor_method)
-    lf = tuple(prof.low_frequency_band_hz) if prof.low_frequency_band_hz else (20.0, 125.0)
-    if len(lf) != 2 or not (0 < lf[0] < lf[1] < prof.sample_rate_hz / 2):
-        raise ConfigRejected("invalid_profile", f"low-frequency band {lf} is not usable")
-    profile = Profile(
-        profile_id=prof.id,
-        calibration_id=cal.id if cal else None,
-        mode=prof.calibration_state,
-        content_hash=prof.content_hash,
-        calibration_content_hash=cal.content_hash if cal else None,
-        capture=local.capture.model_copy(update={"sample_rate": prof.sample_rate_hz}),
-        gain=GainSpec(inspectable=bool(local.expected_gain_controls) or local.builtin_gain_check,
-                      controls=local.expected_gain_controls, reference_check=local.gain_reference_check),
-        gain_db=prof.gain_db,
-        scale=scale,
-        response_correction=correction,
-        noise_floor=noise_floor,
-        supported_metrics=tuple(m for m in prof.supported_metrics if m in METRICS),
-        lf_band_hz=(float(lf[0]), float(lf[1])),
-        microphone_model=prof.microphone_model,
-        microphone_serial=prof.microphone_serial,
-        calibration_file_again_db=_header_db(cal_header.get("AGain")),
-        calibration_file_sens_factor_db=_header_db(cal_header.get("Sens Factor")),
-    )
 
     # Detection rules
     det = doc.detection
@@ -646,6 +459,7 @@ def translate(result: dict, local: LocalInputs, *, verify_hash: bool = True) -> 
         quiet_seconds=quiet,
         rules=rules,
         observation_period_until=det.observation_period_until,
+        max_event_seconds=min(14400, max(60, det.max_event_duration_seconds)),
     )
     if not rules:
         notes.append("no detection rule enabled: measurements only")
@@ -663,26 +477,25 @@ def translate(result: dict, local: LocalInputs, *, verify_hash: bool = True) -> 
     except Exception as exc:
         raise ConfigRejected("out_of_bounds", str(exc)[:500]) from exc
     ret = doc.local_retention
-    retention = RetentionSettings(
-        acknowledged_measurement_days=min(float(ret.measurement_days), local.max_ack_retention_days)
-        if local.acknowledged_retention_days is None else local.acknowledged_retention_days,
-        verified_audio_days=min(float(ret.audio_days), local.max_audio_retention_days)
-        if local.verified_audio_retention_hours is None else local.verified_audio_retention_hours / 24,
-        max_disk_usage_percent=max(10, min(95, ret.max_disk_usage_percent)),
-    )
-    return DeviceConfiguration(
+    return Operational(
         revision=res.revision,
         sha256=res.sha256,
         issued_at=res.issued_at,
         device_id=doc.device_id,
-        deployment_id=dep.id,
-        deployment_content_hash=dep.content_hash,
         channel=ch.channel,
         configured_metrics=tuple(m for m in ch.metrics if m in METRICS),
-        profile=profile,
         detection=detection,
         recording=recording,
         delivery=delivery,
-        retention=retention,
+        retention=_retention(local, ret.measurement_days, ret.audio_days, ret.max_disk_usage_percent),
         notes=tuple(notes),
     )
+
+
+def effective(op: Operational, profile: Profile, chain_notes: tuple[str, ...] = ()) -> DeviceConfiguration:
+    unsupported = [m for m in op.configured_metrics if m not in profile.supported_metrics]
+    notes = list(op.notes) + list(chain_notes)
+    if unsupported and not op.is_local_defaults:
+        notes.append(f"not reported by this profile: {', '.join(unsupported)}")
+    return DeviceConfiguration.model_validate({**{k: getattr(op, k) for k in Operational.model_fields}, "profile": profile,
+                                               "notes": tuple(notes)})

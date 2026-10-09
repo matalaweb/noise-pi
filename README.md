@@ -17,7 +17,7 @@ label in Laravel.
 | Replay harness, DSP, timing, detector, evidence, SQLite state, delivery, config, CLI | Implemented and tested on a development machine (`pytest`: unit, integration, fault injection, contract) |
 | Wire contract | Reconciled with the web app (`my-neighbor-sucks`, vendored in `contract/upstream`). Payloads are schema-validated. A live end-to-end run against the local Laravel stack passed. Server-side gaps are listed in `contract/README.md`. |
 | Live ALSA capture | Implemented and tested with a simulated PortAudio stream. **Not yet run on a Pi with a real microphone.** |
-| Calibration | dBFS collection works. SPL needs a provisioned estimated/calibrated profile and a passing `calibration-check`. **No physical calibration has been done.** |
+| Calibration | dBFS collection works. SPL needs an estimated or calibrated `[calibration]` in `collector.toml` (reported to the web app by the collector itself); `calibrated` needs a passing `calibration-check`. **No physical calibration has been done.** |
 | Hardware acceptance (72 h soak, outage, unplug/replug, timing, calibration) | **Pending.** Procedures are in `docs/hardware-validation.md`. |
 | Optional third-octave bands, LCpeak | Deliberately disabled until validated (reported honestly in capabilities) |
 

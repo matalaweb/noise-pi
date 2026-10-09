@@ -1,24 +1,21 @@
 """Download, validate and stage complete configuration revisions (``GET /configuration``).
 
-Steps 1-3 of the transactional apply happen here: fetch the complete document + provenance,
-verify the canonical SHA-256 and translate it against owner-controlled local inputs, then stage it.
+Steps 1-3 of the transactional apply happen here: fetch the complete document, verify the canonical
+SHA-256 and validate it against owner-controlled local inputs, then stage it. The document carries
+operational settings only; the measurement chain is local (config/chain.py).
 The acquisition process applies a staged revision at a complete measurement boundary and records
 the applied/rejected acknowledgment; this module never acknowledges ``applied``.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import sqlite3
 import time
-from pathlib import Path
 
 from ..acquisition.durability import record_config_ack
-from ..contract.configuration import ConfigRejected, LocalInputs, Provenance, translate
-from ..dsp.calibration import parse_calibration_file
-from ..evidence.fsutil import atomic_write
+from ..contract.configuration import ConfigRejected, LocalInputs, parse_document
 from ..store.db import transaction
 from ..timeutil import iso_utc
 from ..transport.api import NOT_FOUND, OK, ApiClient
@@ -44,63 +41,7 @@ def stage(conn: sqlite3.Connection, result: dict, revision: int, sha256: str) ->
             "INSERT INTO configurations(revision, sha256, document_json, state, received_at) VALUES (?,?,?, 'staged', ?)",
             (revision, sha256, json.dumps(result, sort_keys=True), iso_utc(time.time())),
         )
-        for prof in result.get("provenance", {}).get("measurement_profiles", []):
-            conn.execute(
-                "INSERT OR IGNORE INTO profiles(profile_id, sha256, document_json, received_at) VALUES (?,?,?,?)",
-                (prof["id"], prof["content_hash"], json.dumps(prof, sort_keys=True), iso_utc(time.time())),
-            )
     return "staged"
-
-
-class AssetPending(Exception):
-    """A referenced calibration file could not be downloaded yet (transient)."""
-
-
-MAX_ASSET_BYTES = 4 * 1024 * 1024
-
-
-def fetch_calibration_files(api: ApiClient, conn: sqlite3.Connection, result: dict, asset_dir: Path) -> list[str]:
-    """Download and SHA-256-verify every frequency-response file referenced by the provenance.
-
-    Files are stored by hash under ``asset_dir`` (immutable; never re-downloaded once verified).
-    Only paths on the API origin are fetched, with the device token. Returns downloaded names.
-    """
-    try:
-        prov = Provenance.model_validate(result.get("provenance") or {})
-    except Exception as exc:
-        raise ConfigRejected("malformed_configuration", f"provenance: {exc}"[:500]) from exc
-    fetched = []
-    for cal in prov.calibrations:
-        for att in cal.frequency_response_files():
-            dest = asset_dir / att.sha256
-            if dest.exists() and hashlib.sha256(dest.read_bytes()).hexdigest() == att.sha256:
-                continue
-            if att.byte_size > MAX_ASSET_BYTES or not att.download_path.startswith("/api/v1/device/"):
-                raise ConfigRejected("asset_not_permitted", f"{att.filename}: size or path not permitted")
-            out, data = api.get_bytes(att.download_path, max_bytes=MAX_ASSET_BYTES)
-            if out.kind != OK or data is None:
-                raise AssetPending(f"{att.filename}: {out.kind} {out.error_code}")
-            if hashlib.sha256(data).hexdigest() != att.sha256:
-                raise ConfigRejected("asset_hash_mismatch", att.filename)
-            try:
-                parse_calibration_file(data)
-            except ValueError as exc:
-                raise ConfigRejected("invalid_calibration_file", f"{att.filename}: {exc}") from exc
-            atomic_write(dest, data)
-            with transaction(conn):
-                conn.execute(
-                    "INSERT OR REPLACE INTO profile_assets(sha256, profile_id, filename, path, size_bytes, received_at) VALUES (?,?,?,?,?,?)",
-                    (att.sha256, cal.id, att.filename, f"profiles/{att.sha256}", len(data), iso_utc(time.time())),
-                )
-            fetched.append(att.filename)
-    return fetched
-
-
-def _check_immutable_profiles(conn: sqlite3.Connection, result: dict) -> None:
-    for prof in result.get("provenance", {}).get("measurement_profiles", []):
-        prev = conn.execute("SELECT sha256 FROM profiles WHERE profile_id=?", (prof.get("id"),)).fetchone()
-        if prev is not None and prev["sha256"] != prof.get("content_hash"):
-            raise ConfigRejected("profile_mutated", f"profile {prof.get('id')} content hash changed under the same id")
 
 
 def poll(api: ApiClient, conn: sqlite3.Connection, local: LocalInputs) -> tuple[str, int | None]:
@@ -120,12 +61,7 @@ def poll(api: ApiClient, conn: sqlite3.Connection, local: LocalInputs) -> tuple[
     if known is not None and known["sha256"] == sha:
         return f"known_{known['state']}", rev
     try:
-        _check_immutable_profiles(conn, result)
-        if local.asset_dir is not None:
-            fetch_calibration_files(api, conn, result, Path(local.asset_dir))
-        translate(result, local)
-    except AssetPending as exc:
-        return f"asset_retry:{exc}", rev
+        parse_document(result, local)
     except ConfigRejected as exc:
         log.error("configuration revision %s rejected: %s", rev, exc)
         _store_rejected(conn, result, rev, sha)

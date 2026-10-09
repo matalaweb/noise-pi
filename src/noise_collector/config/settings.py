@@ -26,8 +26,8 @@ class Local(BaseModel):
 class PathsSettings(Local):
     state_dir: Path = Path("/var/lib/noise-collector")
     credentials_file: Path = Path("/etc/noise-collector/credentials.toml")
-    # Owner-provided absolute scales keyed by server calibration UUID (see docs/calibration.md).
-    calibrations_file: Path | None = Path("/etc/noise-collector/calibrations.toml")
+    # Deprecated and ignored: the calibration now lives in [calibration] (docs/calibration.md).
+    calibrations_file: Path | None = None
 
 
 class ServerSettings(Local):
@@ -66,14 +66,19 @@ class MicrophoneSelector(Local):
     expected_gain_controls: dict[str, str] = Field(default_factory=dict)
     # Required for a calibrated profile when gain cannot be read back (spec section 4).
     gain_reference_check: str | None = None
-    # Which serial-specific calibration file to use when the calibration record carries several
-    # (miniDSP UMIK-1: "0deg" pointing at the source, "90deg" pointing up/sideways).
+    # Reported in the measurement profile. For a UMIK-1 the model defaults to "miniDSP UMIK-1" and
+    # the serial to the calibration file's SERNO (its USB serial is a placeholder).
+    microphone_model: str | None = Field(default=None, max_length=255)
+    microphone_serial: str | None = Field(default=None, max_length=255)
+    audio_interface: str | None = Field(default=None, max_length=255)
+    # Deprecated and ignored: [calibration] frequency_response_file names the file directly.
     calibration_orientation: Literal["0deg", "90deg"] | None = None
 
-    @field_validator("usb_vendor_id", "usb_product_id", "usb_serial", "usb_path")
+    @field_validator("usb_vendor_id", "usb_product_id", "usb_serial", "usb_path", "microphone_model", "microphone_serial",
+                     "audio_interface")
     @classmethod
     def _blank(cls, v: str | None) -> str | None:
-        return v or None
+        return (v or "").strip() or None
 
     def ids(self) -> tuple[str | None, str | None]:
         if self.model == "umik-1":
@@ -97,6 +102,55 @@ class CaptureSettings(Local):
     reconnect_delays_s: list[float] = Field(default_factory=lambda: [1, 2, 5, 10, 30])
     watchdog_s: float = Field(default=3.0, ge=1, le=60)
     gain_check_interval_s: float = Field(default=30.0, ge=5, le=3600)
+
+
+class MeasurementSettings(Local):
+    """The measurement chain this device reports to the server (its measurement profile)."""
+
+    sample_rate_hz: Literal[44100, 48000, 96000] = 48000
+    low_frequency_band_hz: tuple[float, float] = (20.0, 125.0)
+    name: str | None = Field(default=None, max_length=255)
+
+    @field_validator("low_frequency_band_hz")
+    @classmethod
+    def _band(cls, v: tuple[float, float]) -> tuple[float, float]:
+        if not 0 < v[0] < v[1]:
+            raise ValueError("low_frequency_band_hz must be [lower, upper] with 0 < lower < upper")
+        return v
+
+
+class CalibrationSettings(Local):
+    """How absolute levels are obtained; reported to the server as this device's calibration record.
+
+    ``uncalibrated``: dBFS only. ``estimated``: an absolute scale from an undocumented or partial
+    chain (for a UMIK-1, the calibration file's Sens Factor). ``calibrated``: a documented chain,
+    e.g. a 94 dB / 1 kHz acoustic calibrator check (``noise-collector calibration-check``).
+    """
+
+    state: Literal["uncalibrated", "estimated", "calibrated"] = "uncalibrated"
+    # RMS dBFS reading for 94 dB SPL at 1 kHz (or the scale in Pa per full scale). For an estimated
+    # UMIK-1 chain it defaults to the calibration file's Sens Factor - 30 dB (REW convention).
+    sensitivity_dbfs_at_94db: float | None = Field(default=None, ge=-140, le=0)
+    pa_per_fs: float | None = Field(default=None, gt=0)
+    # Serial-specific microphone frequency-response file (UMIK-1: <serial>.txt or <serial>_90deg.txt
+    # to match how the microphone is mounted). Reported to the server with its SHA-256.
+    frequency_response_file: Path | None = None
+    apply_frequency_response: bool = True
+    curve_is: Literal["microphone_response", "correction"] = "microphone_response"
+    reference_method: str | None = Field(default=None, max_length=255)
+    reference_device: str | None = Field(default=None, max_length=255)
+    reference_level_db: float | None = Field(default=94.0, gt=0, le=200)
+    reference_frequency_hz: float | None = Field(default=1000.0, gt=0)
+    performed_at: str | None = None
+    performed_by: str | None = Field(default=None, max_length=255)
+    notes: str | None = None
+    noise_floor_laeq_db: float | None = None
+    noise_floor_method: str | None = None
+
+    @field_validator("reference_method", "reference_device", "performed_at", "performed_by", "notes", "noise_floor_method")
+    @classmethod
+    def _blank(cls, v: str | None) -> str | None:
+        return (v or "").strip() or None
 
 
 class ChannelSettings(Local):
@@ -146,6 +200,11 @@ class DashboardSettings(Local):
     bind: str = "127.0.0.1"  # LAN exposure requires an access token
     port: int = Field(default=8765, ge=0, le=65535)  # 0 = ephemeral (tests)
     access_token_file: Path | None = None
+    # Explicit owner opt-out: serve a non-loopback bind without a token (trusted private network;
+    # the page is read-only and never serves audio). Ignored when access_token_file is set.
+    allow_unauthenticated_lan: bool = False
+    # Show a "Stop event" button that ends the open event (owner control; off = strictly read-only).
+    allow_stop_event: bool = False
 
 
 class Settings(Local):
@@ -153,6 +212,8 @@ class Settings(Local):
     server: ServerSettings
     microphone: MicrophoneSelector = MicrophoneSelector()
     capture: CaptureSettings = CaptureSettings()
+    measurement: MeasurementSettings = MeasurementSettings()
+    calibration: CalibrationSettings = CalibrationSettings()
     channel: ChannelSettings = ChannelSettings()
     recording: RecordingLocal = RecordingLocal()
     capabilities: Capabilities = Capabilities()

@@ -1,8 +1,9 @@
-"""Server-shaped example configurations for replay, tests and the fake server.
+"""Example configurations for replay, tests and the fake server.
 
-Identities are placeholders shaped like the Laravel app's (UUIDs). A real deployment receives its
-deployment/profile/calibration identities from the web app; the collector never invents them.
-The example absolute scale (1 Pa RMS at -18 dBFS) is a SYNTHETIC placeholder, not a calibration.
+``configuration_result`` is a ``GET /configuration`` body shaped like the Laravel app's (operational
+settings only). ``example_profile`` is a measurement profile like the one ``config/chain.py`` builds
+from local settings. Identities are placeholders. The example absolute scale (1 Pa RMS at -18 dBFS)
+is a SYNTHETIC placeholder, not a calibration.
 """
 
 from __future__ import annotations
@@ -10,16 +11,20 @@ from __future__ import annotations
 import copy
 
 from .configuration import (
+    COMPUTED_METRICS,
     CaptureSpec,
     DeviceConfiguration,
-    LocalCalibration,
+    GainSpec,
     LocalInputs,
+    Profile,
+    ResponseCorrectionSpec,
+    ScaleSpec,
     configuration_hash,
-    translate,
+    effective,
+    parse_document,
 )
 
 DEVICE_ID = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
-DEPLOYMENT_ID = "ab6de18e-f8aa-4444-aed3-71d3464f07ea"
 PROFILE_IDS = {"calibrated": "2fc235ef-6f5b-48d1-8d35-083dfdd5a6e9", "estimated": "3fc235ef-6f5b-48d1-8d35-083dfdd5a6e9",
                "uncalibrated": "4fc235ef-6f5b-48d1-8d35-083dfdd5a6e9"}
 CALIBRATION_IDS = {"calibrated": "0e745c21-fc8f-40da-9113-7a158c913fc6", "estimated": "1e745c21-fc8f-40da-9113-7a158c913fc6"}
@@ -28,14 +33,10 @@ EXAMPLE_SCALE_PA_PER_FS = 10 ** (18 / 20)  # 1 Pa RMS at -18 dBFS (SYNTHETIC)
 ALL_METRICS = ["laeq_db", "lafmax_db", "lceq_db", "lcpeak_db", "low_frequency_leq_db", "rms_dbfs"]
 
 
-def configuration_result(revision: int = 1, mode: str = "calibrated", *, profile_id: str | None = None,
-                         detection: dict | None = None, recording: dict | None = None, metrics: list[str] | None = None,
-                         reporting_interval_seconds: int = 30, channel: str = CHANNEL, bands_enabled: bool = False,
-                         lf_band: list[float] | None = None, sample_rate_hz: int = 48000,
-                         calibration_extra: dict | None = None) -> dict:
+def configuration_result(revision: int = 1, mode: str = "calibrated", *, detection: dict | None = None,
+                         recording: dict | None = None, metrics: list[str] | None = None,
+                         reporting_interval_seconds: int = 30, channel: str = CHANNEL, bands_enabled: bool = False) -> dict:
     """A ``GET /configuration`` response body shaped exactly like the Laravel app's."""
-    pid = profile_id or PROFILE_IDS[mode]
-    cid = CALIBRATION_IDS.get(mode)
     supported = ["rms_dbfs"] if mode == "uncalibrated" else list(ALL_METRICS)
     det = {
         "rule_version": "owner-rules-v1",
@@ -62,19 +63,11 @@ def configuration_result(revision: int = 1, mode: str = "calibrated", *, profile
             "enabled": True,
             "metrics": list(metrics) if metrics is not None else supported,
             "bands_enabled": bands_enabled,
-            "measurement_profile_id": pid,
-            "deployment_id": DEPLOYMENT_ID,
-            "calibration_id": cid,
-            "calibration_state": mode,
         }],
         "recording": rec,
         "detection": det,
         "local_retention": {"measurement_days": 7, "audio_days": 7, "max_disk_usage_percent": 80},
     }
-    calibrations = []
-    if cid:
-        calibrations.append({"id": cid, "channel": channel, "revision": 1, "calibration_state": mode,
-                             "content_hash": "c" * 64, **(calibration_extra or {})})
     return {
         "request_id": "019a0f3d-5f6a-7cad-9e1f-2a3b4c5d6e7f",
         "server_received_at": "2026-10-08T12:16:01.000Z",
@@ -83,36 +76,72 @@ def configuration_result(revision: int = 1, mode: str = "calibrated", *, profile
         "issued_at": "2026-09-01T00:00:00.000Z",
         "applied_revision": None,
         "configuration": doc,
-        "provenance": {
-            "measurement_profiles": [{
-                "id": pid, "channel": channel, "revision": 1, "calibration_state": mode, "supported_metrics": supported,
-                "sample_rate_hz": sample_rate_hz, "gain_db": 0.0, "low_frequency_band_hz": lf_band or [20.0, 125.0],
-                "band_definitions": None, "content_hash": "a" * 64,
-            }],
-            "deployments": [{"id": DEPLOYMENT_ID, "revision": 1, "effective_at": "2026-01-01T00:00:00.000Z", "content_hash": "d" * 64}],
-            "calibrations": calibrations,
-        },
     }
 
 
-def local_inputs(mode: str = "calibrated", *, with_scale: bool = True, channel: str = CHANNEL,
-                 capture: CaptureSpec | None = None, gain_controls: dict | None = None) -> LocalInputs:
-    cals = {}
-    cid = CALIBRATION_IDS.get(mode)
-    if cid and with_scale:
-        cals[cid] = LocalCalibration(calibration_id=cid, content_hash="c" * 64, pa_per_fs=EXAMPLE_SCALE_PA_PER_FS,
-                                     method="reference_measurement" if mode == "calibrated" else "comparison_estimate")
+def example_profile(mode: str = "calibrated", *, with_scale: bool = True, capture: CaptureSpec | None = None,
+                    gain_controls: dict | None = None, lf_band: tuple[float, float] = (20.0, 125.0),
+                    response_correction: ResponseCorrectionSpec | None = None, **extra) -> Profile:
+    scale = None
+    if mode != "uncalibrated" and with_scale:
+        scale = ScaleSpec(method="reference_measurement" if mode == "calibrated" else "comparison_estimate",
+                          pa_per_fs=EXAMPLE_SCALE_PA_PER_FS, source="SYNTHETIC example")
+    return Profile(
+        profile_id=PROFILE_IDS[mode],
+        calibration_id=CALIBRATION_IDS.get(mode),
+        mode=mode,  # type: ignore[arg-type]
+        content_hash="a" * 64,
+        calibration_content_hash="c" * 64 if mode != "uncalibrated" else None,
+        capture=capture or CaptureSpec(),
+        gain=GainSpec(inspectable=bool(gain_controls), controls=gain_controls or {},
+                      reference_check=None if gain_controls else "SYNTHETIC example: no physical gain"),
+        scale=scale,
+        response_correction=response_correction or ResponseCorrectionSpec(),
+        supported_metrics=("rms_dbfs",) if mode == "uncalibrated" else COMPUTED_METRICS,
+        lf_band_hz=lf_band,
+        **extra,
+    )
+
+
+def local_inputs(*, channel: str = CHANNEL, capture: CaptureSpec | None = None, gain_controls: dict | None = None) -> LocalInputs:
     return LocalInputs(channel=channel, capture=capture or CaptureSpec(), expected_gain_controls=gain_controls or {},
-                       gain_reference_check="SYNTHETIC example: no physical gain" if not gain_controls else None,
-                       calibrations=cals)
+                       gain_reference_check="SYNTHETIC example: no physical gain" if not gain_controls else None)
 
 
 def example_configuration(revision: int = 1, mode: str = "calibrated", *, local: LocalInputs | None = None,
-                          **kw) -> DeviceConfiguration:
-    return translate(configuration_result(revision, mode, **kw), local or local_inputs(mode))
+                          profile: Profile | None = None, with_scale: bool = True, **kw) -> DeviceConfiguration:
+    local = local or local_inputs()
+    op = parse_document(configuration_result(revision, mode, **kw), local)
+    return effective(op, profile or example_profile(mode, with_scale=with_scale, capture=local.capture,
+                                                    gain_controls=local.expected_gain_controls or None))
 
 
 def reseal(result: dict) -> dict:
     out = copy.deepcopy(result)
     out["sha256"] = configuration_hash(out["configuration"])
     return out
+
+
+def example_records(profile: Profile) -> tuple[dict, ...]:
+    """Registration records (config/chain.py shape) for an example profile, so replayed state can be delivered."""
+    from .configuration import document_hash
+
+    prof = {
+        "id": profile.profile_id, "channel": CHANNEL, "name": "SYNTHETIC example", "microphone_model": "SYNTHETIC microphone",
+        "microphone_serial": None, "audio_interface": None, "sample_rate_hz": profile.capture.sample_rate, "gain_db": None,
+        "gain_description": None, "weighting_implementation_version": "example", "filter_implementation_version": "example",
+        "agent_processing_version": "example", "calibration_state": profile.mode,
+        "calibration_application_method": None, "supported_metrics": list(profile.supported_metrics),
+        "low_frequency_lower_hz": profile.lf_band_hz[0], "low_frequency_upper_hz": profile.lf_band_hz[1], "band_centers_hz": [],
+    }
+    out = [{"kind": "measurement_profile", "id": profile.profile_id, "content_hash": document_hash(prof), "record": prof}]
+    if profile.calibration_id:
+        cal = {
+            "id": profile.calibration_id, "channel": CHANNEL, "calibration_state": profile.mode,
+            "reference_method": "SYNTHETIC example scale", "reference_device": None, "reference_level_db": 94.0,
+            "reference_frequency_hz": 1000.0, "sensitivity_mv_per_pa": None, "sensitivity_dbfs_at_94db": -18.0,
+            "gain_configuration": None, "application_method": None, "performed_at": None, "performed_by": None, "notes": None,
+            "attachments": [],
+        }
+        out.append({"kind": "calibration", "id": profile.calibration_id, "content_hash": document_hash(cal), "record": cal})
+    return tuple(out)

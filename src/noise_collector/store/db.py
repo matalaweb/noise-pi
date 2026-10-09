@@ -48,9 +48,23 @@ def connect(path: Path | str, *, readonly: bool = False, check_same_thread: bool
     conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA foreign_keys=ON")
     if not readonly:
-        conn.execute("PRAGMA journal_mode=WAL")
+        _enable_wal(conn)
         conn.execute("PRAGMA synchronous=FULL")
     return conn
+
+
+def _enable_wal(conn: sqlite3.Connection) -> None:
+    """Switching a new database to WAL takes an exclusive lock the busy handler does not wait for
+    (acquisition and delivery open the fresh database at the same moment), so retry it here."""
+    deadline = time.monotonic() + BUSY_TIMEOUT_MS / 1000
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) or time.monotonic() > deadline:
+                raise
+            time.sleep(0.02)
 
 
 @contextlib.contextmanager
@@ -87,6 +101,11 @@ def migrate(path: Path, *, backup_dir: Path | None = None) -> int:
         for version, name, sql in pending:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                # Acquisition and delivery start together and both migrate: re-check under the
+                # write lock so the second one skips what the first just applied.
+                if schema_version(conn) >= version:
+                    conn.execute("COMMIT")
+                    continue
                 for stmt in _split_sql(sql):
                     conn.execute(stmt)
                 conn.execute(

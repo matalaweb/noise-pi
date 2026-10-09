@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -91,27 +92,43 @@ def run_checks(config_path: Path | None) -> list[dict]:
             out.append(_r("database schema", "PASS" if ver == LATEST_SCHEMA else "WARN", f"version {ver}, agent expects {LATEST_SCHEMA}"))
             row = conn.execute("SELECT revision, document_json FROM configurations WHERE state='applied' ORDER BY revision DESC LIMIT 1").fetchone()
             staged = conn.execute("SELECT revision FROM configurations WHERE state='staged' ORDER BY revision DESC LIMIT 1").fetchone()
-            if row:
-                from .config.local_inputs import local_inputs
-                from .contract.configuration import ConfigRejected, translate
+            from .config.chain import ChainError, build_chain
+            from .config.local_inputs import local_inputs
+            from .contract.configuration import ConfigRejected, parse_document
+            from .store.db import get_meta
 
+            try:
+                chain = build_chain(s, get_meta(conn, "installation_id") or "unregistered")
+                p = chain.profile
+                note = {"uncalibrated": "dBFS only; SPL fields are null",
+                        "estimated": "SPL values are labelled as estimates", "calibrated": "calibrated chain; confirm with calibration-check"}[p.mode]
+                status = "PASS"
+                if p.mode != "uncalibrated" and p.scale is None:
+                    status, note = "WARN", "no absolute scale: SPL fields are null"
+                out.append(_r("measurement chain", status, f"{p.microphone_model} serial {p.microphone_serial or '-'}, {p.mode}: {note}"))
+                for n in chain.notes:
+                    out.append(_r("measurement chain note", "INFO", n))
                 try:
-                    eff = translate(json.loads(row["document_json"]), local_inputs(s), verify_hash=False)
-                    mode = eff.profile.mode
-                    note = {"uncalibrated": "dBFS only; SPL fields are null",
-                            "estimated": "SPL values are labelled as estimates", "calibrated": "calibrated profile; confirm with calibration-check"}[mode]
-                    status = "PASS"
-                    if mode != "uncalibrated" and eff.profile.scale is None:
-                        status, note = "WARN", "no absolute scale for this calibration: SPL fields are null (see calibrations.toml)"
-                    out.append(_r("configuration", status, f"applied revision {row['revision']}, channel {eff.channel}, profile {eff.profile.profile_id} ({mode}): {note}"))
-                    for n in eff.notes:
+                    reg = {r["state"]: r["n"] for r in conn.execute("SELECT state, COUNT(*) n FROM provenance_records GROUP BY state")}
+                except sqlite3.OperationalError:  # schema not migrated yet (service not restarted after an upgrade)
+                    reg = {"not yet migrated": 1}
+                if reg:
+                    out.append(_r("chain registration", "WARN" if reg.get("rejected") else "INFO",
+                                  ", ".join(f"{k} {v}" for k, v in sorted(reg.items()))))
+            except ChainError as exc:
+                out.append(_r("measurement chain", "FAIL", f"{exc} (fix [microphone]/[calibration] in collector.toml)"))
+            if row:
+                try:
+                    op = parse_document(json.loads(row["document_json"]), local_inputs(s), verify_hash=False)
+                    out.append(_r("configuration", "PASS", f"applied revision {row['revision']}, channel {op.channel}"))
+                    for n in op.notes:
                         out.append(_r("configuration note", "INFO", n))
                 except ConfigRejected as exc:
                     out.append(_r("configuration", "FAIL", f"applied revision {row['revision']} unusable with local settings: {exc}"))
             elif staged:
                 out.append(_r("configuration", "INFO", f"revision {staged['revision']} staged, not yet applied"))
             else:
-                out.append(_r("configuration", "WARN", "no configuration: diagnostics only until provisioned"))
+                out.append(_r("configuration", "INFO", "none published: running on local defaults (measurements only)"))
             del schema_version
 
     from .timing.clock import SystemClock
@@ -142,8 +159,10 @@ def run_checks(config_path: Path | None) -> list[dict]:
         if umik1.is_umik1(dev.vendor_id, dev.product_id, dev.product):
             ok, note = umik1.mixer_check(g)
             out.append(_r("UMIK-1 mixer", "PASS" if ok else "FAIL", note or "Mic capture at 0.00 dB, on"))
-            out.append(_r("UMIK-1 analog gain", "INFO", f"{umik1.analog_gain_db(dev.product)} dB (from '{dev.product}'); "
-                                                         "the calibration file's AGain must match"))
+            again = umik1.analog_gain_db(dev.product)
+            out.append(_r("UMIK-1 analog gain", "INFO",
+                          f"{again} dB (from '{dev.product}'); the calibration file's AGain must match" if again is not None else
+                          f"not reported by this unit ('{dev.product}'); use the calibration files miniDSP issued for this serial"))
             if umik1.real_serial(dev.serial) is None:
                 out.append(_r("UMIK-1 serial", "INFO", "USB serial is a placeholder; the real serial comes from the calibration file "
                                                        "and the web-app profile" + ("" if s.microphone.usb_path else

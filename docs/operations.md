@@ -16,7 +16,7 @@
 ## Install / provision
 
 ```bash
-sudo deploy/install.sh
+sudo bash deploy/install.sh
 sudoedit /etc/noise-collector/credentials.toml       # device_token = "..."  (never on a command line)
 sudo chown noise-collector:noise-collector /etc/noise-collector/credentials.toml && sudo chmod 600 $_
 sudo -u noise-collector /opt/noise-collector/venv/bin/noise-collector devices   # USB identity, formats, gain controls
@@ -79,13 +79,15 @@ Upgrades are owner-initiated pinned releases. Nothing updates itself.
 
 1. `noise-collector backup /var/lib/noise-collector/backups/pre-upgrade.db`, and copy
    `recordings/` and `spool/` if you want a full snapshot.
-2. `sudo deploy/install.sh` from the new release. It keeps data and config, and keeps the
-   previous venv as `venv.prev`.
+2. `sudo bash deploy/install.sh` from the new release. It builds a fresh virtualenv under
+   `/opt/noise-collector/releases/<time>/`, repoints the `venv` symlink to it, and keeps the
+   prior release as `previous`. Data and config are untouched.
 3. `sudo systemctl restart noise-collector`. Migrations run before capture starts, and a
    pre-migration database backup is written to `backups/` automatically.
-4. Rollback: `sudo systemctl stop noise-collector`, swap `venv.prev` back. If the newer version
-   migrated the schema, also restore the pre-migration backup. An older agent refuses to open a
-   newer schema rather than corrupt it.
+4. Rollback: `sudo systemctl stop noise-collector`, then
+   `sudo ln -sfn "$(readlink /opt/noise-collector/previous)" /opt/noise-collector/venv`. If the
+   newer version migrated the schema, also restore the pre-migration backup. An older agent refuses
+   to open a newer schema rather than corrupt it.
 
 ## Backups
 

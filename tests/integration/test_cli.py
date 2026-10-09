@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from noise_collector import cli
-from noise_collector.contract.examples import DEPLOYMENT_ID, PROFILE_IDS, configuration_result
+from noise_collector.contract.examples import configuration_result
 from noise_collector.synth import write_wav
 
 
@@ -40,13 +40,16 @@ trusted_storage_hosts = ["bucket.storage.test"]
 usb_vendor_id = "2752"
 usb_product_id = "0007"
 usb_serial = "7000001"
+microphone_model = "SYNTHETIC test microphone"
+gain_reference_check = "test: synthetic"
+
+[calibration]
+state = "calibrated"
+sensitivity_dbfs_at_94db = -18.0
+reference_method = "SYNTHETIC test"
 
 [channel]
 id = "mic-1"
-
-[expected]
-deployment_id = "{DEPLOYMENT_ID}"
-profile_id = "{PROFILE_IDS['calibrated']}"
 """)
     return boot, s, tmp_path
 
@@ -68,10 +71,18 @@ def test_provision_requires_confirmation_then_stages(bootstrap, capsys):
     assert (row["revision"], row["state"]) == (3, "staged")
 
 
-def test_provision_detects_identity_mismatch(bootstrap):
+def test_provision_reports_an_unusable_chain(bootstrap, capsys):
     boot, s, tmp = bootstrap
-    boot.write_text(boot.read_text().replace(PROFILE_IDS["calibrated"], "00000000-0000-4000-8000-000000000000"))
+    boot.write_text(boot.read_text().replace('sensitivity_dbfs_at_94db = -18.0\n', ""))
     assert cli.main(["provision", "--bootstrap", str(boot), "--output", str(tmp / "c.toml"), "--yes"]) == 3
+    assert "needs sensitivity_dbfs_at_94db" in capsys.readouterr().out
+
+
+def test_provision_without_published_configuration_runs_on_defaults(bootstrap, fake_server, capsys):
+    boot, s, tmp = bootstrap
+    fake_server.config_result = None
+    assert cli.main(["provision", "--bootstrap", str(boot), "--output", str(tmp / "c.toml"), "--yes"]) == 0
+    assert "local defaults" in capsys.readouterr().out
 
 
 def test_calibration_check_from_reference_file(tmp_path, capsys, monkeypatch):

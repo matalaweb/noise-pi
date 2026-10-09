@@ -293,7 +293,7 @@ class AcquisitionEngine:
             self.sink.submit(ops.ConfigApplied(cfg.revision, "rejected", None, "incompatible_configuration", str(exc)[:500],
                                                cfg.sha256))
             return
-        forced = cfg.profile != old.profile or cfg.deployment_id != old.deployment_id
+        forced = cfg.profile != old.profile
         ring_change = cfg.recording.pre_roll_seconds != old.recording.pre_roll_seconds
         self.config = cfg
         if forced:
@@ -624,7 +624,6 @@ class AcquisitionEngine:
             channel=self.config.channel,
             captured_at=iso_second(k),
             duration_ms=1000,
-            deployment_id=self.config.deployment_id,
             profile_id=p.profile_id,
             calibration_id=p.calibration_id,
             configuration_revision=self.config.revision,
@@ -665,6 +664,10 @@ class AcquisitionEngine:
                 if self.event is None:
                     continue
                 self.event.provisional_end = a.provisional_end_second
+                if a.reason == "max_duration":
+                    self.event.flags.add("max_duration_reached")
+                elif a.reason == "operator_stop":
+                    self.event.flags.add("ended_by_operator")
                 if a.post_roll_truncated:
                     self.event.flags.add("post_roll_truncated")
                     self._stop_recording(a.reason or "post_roll_truncated", at=self.ring.end if info is None else None)
@@ -678,6 +681,17 @@ class AcquisitionEngine:
                     continue
                 self._stop_recording(a.reason)
                 self._finish_event("incomplete", a.reason, last_observed=a.last_observed_second)
+
+    def force_end_event(self, event_id: str) -> bool:
+        """Owner stop (local dashboard) of the open event ``event_id`` at the last completed interval."""
+        if self.event is None or self.event.event_id != event_id or not self.history:
+            return False
+        info = self.history[-1]
+        actions = self.detector.force_end(info.second)
+        if not actions:
+            return False
+        self._handle(actions, info)
+        return True
 
     def _interval_start_sample(self, k: int) -> int | None:
         for i in self.history:
@@ -693,7 +707,6 @@ class AcquisitionEngine:
             session_id=self.session.session_id,
             start=a,
             provenance={
-                "deployment_id": self.config.deployment_id,
                 "profile_id": p.profile_id,
                 "calibration_id": p.calibration_id,
                 "configuration_revision": self.config.revision,
@@ -880,6 +893,8 @@ class AcquisitionEngine:
                 flags.add("clipping")
         if self._scale_missing():
             flags.add("invalid_calibration")
+        if final:
+            flags.update(f for f in ("max_duration_reached", "ended_by_operator") if f in ev.flags)
         if state == "incomplete":
             flags.add("incomplete_interval")
             cause = INCOMPLETE_FLAG.get(termination_reason or "")
@@ -898,7 +913,6 @@ class AcquisitionEngine:
             revision=ev.revision,
             sent_at=self._utc_now_iso(),
             channel=self.config.channel,
-            deployment_id=ev.provenance["deployment_id"],
             profile_id=ev.provenance["profile_id"],
             calibration_id=ev.provenance["calibration_id"],
             configuration_revision=ev.provenance["configuration_revision"],

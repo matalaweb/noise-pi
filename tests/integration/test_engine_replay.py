@@ -143,6 +143,38 @@ def test_long_event_segments_without_gaps_or_overlap(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM measurements WHERE status='omitted' AND utc_second > ?", (K0 + 10,)).fetchone()[0] == 0
 
 
+def test_level_shift_event_ends_at_max_duration_and_baseline_relearns(tmp_path):
+    """A door opened and left open: a loud burst, then a background ~10.5 dB above the old one
+    (above the exit level of baseline + 12 - 3 dB, below the +12 dB trigger)."""
+    from noise_collector.synth import _scale_to, pink_noise, write_wav
+    from support.upstream import errors as schema_errors
+
+    sc = Scenario(duration_s=600, background_dbfs=-60, bursts=[Burst(300, 15, "garage_door_like", -30)], seed=11)
+    x = sc.render()
+    shift = int(315 * FS)
+    x[shift:] += _scale_to(pink_noise(len(x) - shift, np.random.default_rng(12)), -49.9)
+    wavp = tmp_path / "shift.wav"
+    write_wav(str(wavp), x)
+    cfg = example_configuration(detection={"max_event_duration_seconds": 120})
+    assert cfg.detection.max_event_seconds == 120
+    replay(str(wavp), tmp_path / "s", cfg, start_utc=START_UTC)
+    conn = db(tmp_path / "s")
+    revs = events(conn)
+    finals = [e for e in revs if e["detection_state"] == "finalized"]
+    assert len(finals) == 1  # no new event once the baseline re-learnt the raised level
+    ev = finals[0]
+    started = int(ev["started_at"][17:19]) + 60 * int(ev["started_at"][14:16])
+    ended = int(ev["ended_at"][17:19]) + 60 * int(ev["ended_at"][14:16])
+    assert (ended - started) % 3600 == 120
+    assert "max_duration_reached" in ev["quality_flags"] and "incomplete_interval" not in ev["quality_flags"]
+    assert ev["recording"]["expected"] and ev["recording"]["ended_at"].startswith(ev["ended_at"][:19])
+    assert schema_errors("EventRevisionRequest", ev) == []
+    recs = recordings(conn)
+    assert recs and sum(r["sample_count"] for r in recs) <= (120 + 10) * FS  # pre-roll + event, no post-roll
+    row = conn.execute("SELECT state FROM events").fetchone()
+    assert row["state"] == "complete"
+
+
 def test_buffer_overflow_mid_event_terminates_observed_segment(engine_wav, tmp_path):
     faults = Faults(drop={160 * FS + 1234: 9600})
     replay(str(engine_wav), tmp_path / "s", example_configuration(), start_utc=START_UTC, faults=faults)
@@ -271,6 +303,24 @@ class Harness:
         self.applier.close("end")
 
 
+def test_owner_stop_finalizes_the_open_event_with_its_flag(engine_wav, tmp_path):
+    from support.upstream import errors as schema_errors
+
+    h = Harness(engine_wav, tmp_path / "s", example_configuration())
+    h.run_until(158 * FS)
+    assert h.engine.detector.state == "active"
+    eid = h.engine.event.event_id
+    assert not h.engine.force_end_event("00000000-0000-4000-8000-000000000000")  # not the open event
+    assert h.engine.force_end_event(eid)
+    assert h.engine.event is None and not h.engine.force_end_event(eid)
+    h.finish()
+    conn = db(tmp_path / "s")
+    final = [e for e in events(conn) if e["event_id"] == eid and e["detection_state"] == "finalized"]
+    assert len(final) == 1 and "ended_by_operator" in final[0]["quality_flags"]
+    assert schema_errors("EventRevisionRequest", final[0]) == []
+    assert conn.execute("SELECT state FROM events WHERE event_id=?", (eid,)).fetchone()[0] == "complete"
+
+
 def test_threshold_change_mid_event_is_deferred_and_acknowledged(engine_wav, tmp_path):
     h = Harness(engine_wav, tmp_path / "s", example_configuration())
     h.run_until(158 * FS)
@@ -291,7 +341,9 @@ def test_profile_change_mid_event_forces_split(engine_wav, tmp_path):
     h = Harness(engine_wav, tmp_path / "s", example_configuration())
     h.run_until(158 * FS)
     new_profile = "9fc235ef-6f5b-48d1-8d35-083dfdd5a6e9"
-    h.engine.request_config(example_configuration(2, profile_id=new_profile))
+    from noise_collector.contract.examples import example_profile
+
+    h.engine.request_config(example_configuration(2, profile=example_profile().model_copy(update={"profile_id": new_profile})))
     h.run_until(161 * FS)
     h.finish()
     evs = events(h.conn)
@@ -319,9 +371,7 @@ def test_gain_mismatch_withholds_spl_under_same_profile(engine_wav, tmp_path):
 
 
 def test_calibrated_profile_without_scale_sends_flagged_nulls(engine_wav, tmp_path):
-    from noise_collector.contract.examples import local_inputs
-
-    cfg = example_configuration(local=local_inputs(with_scale=False))
+    cfg = example_configuration(with_scale=False)
     replay(str(engine_wav), tmp_path / "s", cfg, start_utc=START_UTC)
     conn = db(tmp_path / "s")
     w = json.loads(conn.execute("SELECT wire_json FROM measurements WHERE status='complete' LIMIT 1").fetchone()[0])

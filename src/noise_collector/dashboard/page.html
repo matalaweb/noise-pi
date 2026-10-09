@@ -51,6 +51,10 @@ th { color: var(--muted); font-weight: 600; }
 .tablewrap { overflow-x: auto; }
 .flag { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 6px; background: var(--pill); color: var(--muted); margin-right: 3px; }
 .empty { color: var(--muted); padding: 10px 2px; }
+.ctl { display: flex; gap: 8px; align-items: center; }
+.btn { font: inherit; font-size: 13px; font-weight: 600; padding: 5px 12px; border-radius: 8px; cursor: pointer; border: 1px solid var(--bad); background: transparent; color: var(--bad); }
+.btn:disabled { opacity: .5; cursor: default; }
+#ctlMsg { font-size: 12.5px; color: var(--muted); }
 @media (max-width: 600px) { .tile .v { font-size: 22px; } header { padding-top: 10px; } }
 </style>
 </head>
@@ -58,6 +62,7 @@ th { color: var(--muted); font-weight: 600; }
 <header>
   <h1>Noise collector — live</h1>
   <div class="pills" id="pills"><span class="pill">connecting…</span></div>
+  <div class="ctl"><button class="btn" id="stopEvent" type="button" hidden>Stop event</button><span id="ctlMsg"></span></div>
 </header>
 <main>
   <section class="panel">
@@ -143,7 +148,7 @@ function connect(since) {
   });
   es.addEventListener("status", ev => {
     const s = JSON.parse(ev.data); const prevEvent = state.status?.detection?.event_id;
-    state.status = s; renderPills(); draw();
+    state.status = s; renderPills(); renderControls(); draw();
     if (s.detection?.event_id !== prevEvent) getJSON(`/api/events?seconds=86400`).then(e => { state.events = e.events; renderEvents(); draw(); });
   });
   es.onerror = () => renderPills(true);
@@ -192,6 +197,26 @@ function renderPills(disconnected) {
   const q = s.delivery?.queued_measurements; box.appendChild(pill("Upload", s.delivery?.auth_blocked ? "auth blocked" : (q ? `${q} queued` : "up to date"), s.delivery?.auth_blocked ? "bad" : (q > 120 ? "warn" : "ok")));
   if (s.storage?.state && s.storage.state !== "ok") box.appendChild(pill("Storage", s.storage.state, "warn"));
 }
+
+function renderControls() {
+  const s = state.status, b = document.getElementById("stopEvent");
+  const id = s?.detection?.event_id;
+  b.hidden = !(s?.controls?.stop_event && id);
+  if (b.dataset.eventId !== (id || "")) { b.dataset.eventId = id || ""; b.disabled = false; }
+}
+
+async function stopEvent() {
+  const b = document.getElementById("stopEvent"), msg = document.getElementById("ctlMsg"), id = b.dataset.eventId;
+  if (!id || !confirm("Stop the current event now?\n\nIt ends at the current second (marked as ended manually), its recording stops, and the detector re-learns the background level.")) return;
+  b.disabled = true; msg.textContent = "stopping…";
+  try {
+    const r = await fetch(`/api/events/${id}/stop`, {method: "POST", credentials: "same-origin", headers: {"X-Noise-Collector": "stop-event"}});
+    msg.textContent = r.status === 202 ? "stop requested" : (r.status === 409 ? "event already ended" : `failed (${r.status})`);
+    if (r.status !== 202) b.disabled = false;
+  } catch (e) { msg.textContent = "failed (network)"; b.disabled = false; }
+  setTimeout(() => { msg.textContent = ""; }, 8000);
+}
+document.getElementById("stopEvent").addEventListener("click", stopEvent);
 
 function renderEvents() {
   const tb = document.getElementById("events"); tb.replaceChildren();

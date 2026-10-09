@@ -1,22 +1,26 @@
 """miniDSP UMIK-1 specifics (see docs/umik1.md for sources and the evidence behind each rule).
 
 Identity
-  USB 2752:0007, product string ``Umik-1  Gain: 18dB`` (two spaces; the number is the internal
-  analog gain set by DIP switches: 0/12/18 dB seen in the field). The ALSA card id is derived from
-  that string (``U18dB``, ``U0dB``...), so it is never used for matching. The USB iSerial is a
+  USB 2752:0007. Older units report the product string ``Umik-1  Gain: 18dB`` (two spaces; the
+  number is the internal analog gain: 0/12/18 dB seen in the field); a newer revision (bcdDevice
+  1.23, manufacturer ``miniDSP Ltd.``, mono, asynchronous endpoint) reports just ``UMIK-1`` and no
+  gain. The ALSA card id is derived from the product string (``U18dB``, ``UMIK1``...), so it is
+  never used for matching. The USB iSerial is a
   placeholder (``000-0000`` or ``1``) on every unit: the real serial is the 7-digit number on the
   body and in the calibration file (``SERNO``). Physical identity is therefore pinned by USB port
   path (or "exactly one UMIK-1 connected") plus the calibration file serial on the web-app profile.
 
 Format
-  UAC1, S24_3LE, 48 kHz only. Most units expose 2 channels carrying the same signal; some are mono.
+  UAC1, S24_3LE, 48 kHz only. Older units expose 2 channels carrying the same signal; others
+  (including the newer revision) are mono.
   ``hw:`` cannot convert, so capture uses the native channel count and analyses one channel; the
   two channels are compared continuously and never averaged.
 
 Gain
   ``Mic`` capture volume is a real digital gain (USB-C units: 0..127 = -63.5..0.00 dB). It must sit
   at the 0.00 dB step with the switch on; the analog gain in the product string must equal the
-  calibration file's ``AGain`` when present.
+  calibration file's ``AGain`` when both are present (units that do not report it are noted, not
+  failed).
 
 Sensitivity (estimate only)
   REW's convention for UMIK calibration files: ``Sens Factor`` is the dBFS reading for 100 dB SPL at
@@ -103,6 +107,10 @@ def gain_check(reading: GainReading, product: str | None, expected_again_db: flo
     if expected_again_db is not None and gain is not None and float(gain) != float(expected_again_db):
         return False, (f"UMIK-1 analog gain is {gain} dB but the calibration file is for AGain {expected_again_db:g} dB; "
                        "use the calibration file for this gain setting")
+    if expected_again_db is not None and gain is None:
+        unreported = (f"this UMIK-1 does not report its analog gain (product '{product}'), so the calibration file's "
+                      f"AGain {expected_again_db:g} dB cannot be checked against the device")
+        note = "; ".join(n for n in (note, unreported) if n)
     return ok, note
 
 

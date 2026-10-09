@@ -230,3 +230,18 @@ def test_online_backup_includes_wal_content(state_dir, tmp_path):
     backup(conn, tmp_path / "b.db")
     b = sqlite3.connect(tmp_path / "b.db")
     assert b.execute("SELECT value FROM metadata WHERE key='k'").fetchone()[0] == "v"
+
+
+def test_concurrent_migrations_from_two_processes(tmp_path):
+    # acquisition and delivery start together and both migrate the same fresh database
+    import multiprocessing as mp
+
+    from noise_collector.store.db import LATEST_SCHEMA
+
+    db = tmp_path / "collector.db"
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(4) as pool:
+        versions = pool.map(migrate, [db] * 4)
+    assert versions == [LATEST_SCHEMA] * 4
+    conn = connect(db)
+    assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == LATEST_SCHEMA

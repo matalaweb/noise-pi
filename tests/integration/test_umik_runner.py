@@ -7,7 +7,6 @@ and the durability layer.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import threading
 import time
@@ -69,24 +68,23 @@ class StereoStream:
 
 def setup(make_settings, monkeypatch, device, channels=2, with_file=True):
     s = make_settings(timing={"require_clock_sync": False}, capture={"channels": channels, "watchdog_s": 1.0, "reconnect_delays_s": [0.2]},
-                      microphone={"model": "umik-1", "usb_serial": None, "usb_vendor_id": None, "usb_product_id": None})
-    migrate(s.db_path)
-    atts = []
+                      microphone={"model": "umik-1", "usb_serial": None, "usb_vendor_id": None, "usb_product_id": None,
+                                  "microphone_model": None, "gain_reference_check": None},
+                      calibration={"state": "estimated", "sensitivity_dbfs_at_94db": None, "reference_method": None})
     if with_file:
-        sha = hashlib.sha256(CAL).hexdigest()
-        (s.state_dir / "profiles").mkdir()
-        (s.state_dir / "profiles" / sha).write_bytes(CAL)
-        atts = [{"id": "019a0f3d-7e7e-7000-8000-00000000c41f", "purpose": "frequency_response", "filename": "7103946_90deg.txt",
-                 "byte_size": len(CAL), "sha256": sha, "download_path": "/api/v1/device/calibrations/x/attachments/y"}]
-    res = configuration_result(1, calibration_extra={"sensitivity_dbfs_at_94db": -30.837, "attachments": atts},
-                               detection={"baseline_relative": {"baseline_window_seconds": 60}})
-    res["provenance"]["measurement_profiles"][0].update(microphone_model="miniDSP UMIK-1", microphone_serial="7103946")
+        f = s.state_dir.parent / "7103946_90deg.txt"
+        f.write_bytes(CAL)
+        s.calibration.frequency_response_file = f
+    else:
+        s.calibration.sensitivity_dbfs_at_94db = -30.837
+    migrate(s.db_path)
+    res = configuration_result(1, mode="estimated", detection={"baseline_relative": {"baseline_window_seconds": 60}})
     res = {k: v for k, v in res.items() if k not in ("request_id", "server_received_at")}
     conn = connect(s.db_path)
     with transaction(conn):
         conn.execute("INSERT INTO configurations(revision, sha256, document_json, state, received_at) VALUES (1,?,?, 'staged', 'now')",
                      (res["sha256"], json.dumps(res)))
-    mono = to_pcm(Scenario(duration_s=40, background_dbfs=-50, bursts=[Burst(20, 6, "engine_like", -25)], seed=5).render())
+    mono = to_pcm(Scenario(duration_s=120, background_dbfs=-50, bursts=[Burst(20, 6, "engine_like", -25)], seed=5).render())
     frames = mono.reshape(-1, 1).repeat(2, axis=1)  # a UMIK-1 carries the same signal on both channels
     monkeypatch.setattr(runner_mod, "list_usb_audio", lambda: [device])
     monkeypatch.setattr(runner_mod, "portaudio_index", lambda d: 7)
@@ -102,11 +100,16 @@ def setup(make_settings, monkeypatch, device, channels=2, with_file=True):
     return s, conn
 
 
-def run_for(s, seconds):
+def run_for(s, seconds, until_rows=0):
+    """Run the loop for ``seconds``, or longer (up to 20 s) until ``until_rows`` complete rows exist."""
     r = runner_mod.AcquisitionRunner(s)
     th = threading.Thread(target=r.run, daemon=True)
     th.start()
     time.sleep(seconds)
+    conn = connect(s.db_path)
+    deadline = time.time() + 20
+    while time.time() < deadline and conn.execute("SELECT COUNT(*) FROM measurements WHERE status='complete'").fetchone()[0] < until_rows:
+        time.sleep(0.2)
     status = json.loads((s.state_dir / "run" / "acquisition-status.json").read_text())
     r.request_stop()
     th.join(30)
@@ -115,7 +118,7 @@ def run_for(s, seconds):
 
 def test_stereo_umik_captures_channel_zero_with_verified_gain(make_settings, monkeypatch):
     s, conn = setup(make_settings, monkeypatch, umik(18))
-    status = run_for(s, 2.5)
+    status = run_for(s, 2.5, until_rows=30)
     assert status["microphone_state"] == "ok", status["latest_capture_error"]
     cap = status["capture_buffer"]
     assert cap["channel_blocks"] > 50 and cap["channel_mismatch_blocks"] == 0

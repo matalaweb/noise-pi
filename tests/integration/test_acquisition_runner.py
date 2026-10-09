@@ -61,7 +61,8 @@ class FakeStream:
 
 @pytest.fixture
 def runner_env(make_settings, monkeypatch):
-    s = make_settings(timing={"require_clock_sync": False}, capture={"watchdog_s": 1.0, "reconnect_delays_s": [0.2]})
+    s = make_settings(timing={"require_clock_sync": False}, capture={"watchdog_s": 1.0, "reconnect_delays_s": [0.2]},
+                      calibration={"state": "uncalibrated", "sensitivity_dbfs_at_94db": None})
     migrate(s.db_path)
     res = configuration_result(1, mode="uncalibrated", detection={"baseline_relative": {"baseline_window_seconds": 60}})
     res = {k: v for k, v in res.items() if k not in ("request_id", "server_received_at")}
@@ -121,3 +122,39 @@ def test_runner_captures_reconnects_and_persists(runner_env):
     flags = [json.loads(x[0])["quality_flags"] for x in conn.execute("SELECT wire_json FROM measurements WHERE status='complete'")]
     assert not any("timestamp_fallback" in f for f in flags)
     assert np.isfinite(status["uptime_s"])
+
+
+def test_runner_measures_on_local_defaults_and_queues_its_chain(runner_env):
+    s, conn, streams, plugs = runner_env
+    with transaction(conn):
+        conn.execute("DELETE FROM configurations")  # nothing published yet
+    r = runner_mod.AcquisitionRunner(s)
+    th = threading.Thread(target=r.run, daemon=True)
+    th.start()
+    deadline = time.time() + 20
+    while time.time() < deadline and conn.execute("SELECT COUNT(*) FROM measurements WHERE status='complete'").fetchone()[0] < 5:
+        time.sleep(0.2)
+    status = json.loads((s.state_dir / "run" / "acquisition-status.json").read_text())
+    r.request_stop()
+    th.join(30)
+    rows = [json.loads(x[0]) for x in conn.execute("SELECT wire_json FROM measurements WHERE status='complete'")]
+    assert len(rows) >= 5 and all(x["configuration_revision"] is None and "deployment_id" not in x for x in rows)
+    assert status["engine"]["configuration_revision"] is None and status["engine"]["profile_mode"] == "uncalibrated"
+    prov = conn.execute("SELECT record_id, kind, state FROM provenance_records").fetchall()
+    assert [(p["kind"], p["state"]) for p in prov] == [("measurement_profile", "pending")]
+    assert rows[0]["profile_id"] == prov[0]["record_id"] and rows[0]["calibration_id"] is None
+    assert conn.execute("SELECT COUNT(*) FROM config_acknowledgments").fetchone()[0] == 0  # nothing to acknowledge
+
+
+def test_runner_reports_an_unusable_chain(runner_env):
+    s, conn, streams, plugs = runner_env
+    s.calibration.state = "estimated"  # no sensitivity and no UMIK file to derive one
+    r = runner_mod.AcquisitionRunner(s)
+    th = threading.Thread(target=r.run, daemon=True)
+    th.start()
+    time.sleep(1.5)
+    status = json.loads((s.state_dir / "run" / "acquisition-status.json").read_text())
+    r.request_stop()
+    th.join(30)
+    assert status["microphone_state"] == "local_config_error" and "needs sensitivity_dbfs_at_94db" in status["latest_capture_error"]
+    assert conn.execute("SELECT COUNT(*) FROM measurements").fetchone()[0] == 0

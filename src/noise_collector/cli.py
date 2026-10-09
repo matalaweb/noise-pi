@@ -85,19 +85,20 @@ def cmd_doctor(args) -> int:
 
 
 def cmd_provision(args) -> int:
-    """Write local settings, initialise state, fetch and stage the server configuration."""
+    """Write local settings, initialise state, check the measurement chain, fetch any server configuration."""
     import tomllib
 
+    from .config.chain import ChainError, build_chain, installation_id
     from .config.local_inputs import local_inputs
     from .config.settings import Settings, load_token
-    from .contract.configuration import translate
+    from .contract.configuration import parse_document
     from .delivery import config_manager
     from .store.db import connect, migrate
     from .transport.api import ApiClient
 
     with open(args.bootstrap, "rb") as fh:
         boot = tomllib.load(fh)
-    expected = boot.pop("expected", {})
+    boot.pop("expected", None)  # obsolete: the device reports its own profile and calibration
     settings = Settings.model_validate(boot)
     token = load_token(settings.paths.credentials_file)
     out_path = Path(args.output)
@@ -112,24 +113,26 @@ def cmd_provision(args) -> int:
     settings.state_dir.mkdir(parents=True, exist_ok=True)
     migrate(settings.db_path)
     conn = connect(settings.db_path)
+    try:
+        chain = build_chain(settings, installation_id(conn))
+    except ChainError as exc:
+        print(f"[provision] measurement chain unusable: {exc}")
+        return 3
+    p = chain.profile
+    print(f"[provision] measurement chain: {p.microphone_model} serial={p.microphone_serial} mode={p.mode} "
+          f"profile={p.profile_id} calibration={p.calibration_id} (registered with the server on first delivery)")
+    for note in chain.notes:
+        print(f"[provision] note: {note}")
     api = ApiClient(settings.server, token)
     result, rev = config_manager.poll(api, conn, local_inputs(settings))
     print(f"[provision] configuration poll: {result} (revision {rev})")
-    row = conn.execute("SELECT document_json FROM configurations WHERE revision=?", (rev,)).fetchone() if rev else None
+    row = conn.execute("SELECT document_json FROM configurations WHERE revision=? AND state='staged'", (rev,)).fetchone() if rev else None
     if row is None:
-        print("[provision] no valid configuration staged; the collector will run diagnostics only until one is available")
-        return 2
-    eff = translate(json.loads(row["document_json"]), local_inputs(settings))
-    problems = []
-    for key, val in (("deployment_id", eff.deployment_id), ("profile_id", eff.profile.profile_id),
-                     ("calibration_id", eff.profile.calibration_id)):
-        if key in expected and expected[key] != val:
-            problems.append(f"{key}: expected {expected[key]!r}, server issued {val!r}")
-    if problems:
-        print("[provision] MISMATCH with expected identities:\n  " + "\n  ".join(problems))
-        return 3
-    print(f"[provision] staged revision {rev}: channel={eff.channel} deployment={eff.deployment_id} profile={eff.profile.profile_id} mode={eff.profile.mode}")
-    for note in eff.notes:
+        print("[provision] no configuration staged: the collector runs on local defaults (measurements only) until one is published")
+        return 0
+    op = parse_document(json.loads(row["document_json"]), local_inputs(settings))
+    print(f"[provision] staged revision {rev}: channel={op.channel} metrics={','.join(op.configured_metrics)}")
+    for note in op.notes:
         print(f"[provision] note: {note}")
     return 0
 
@@ -314,19 +317,16 @@ def cmd_repair_plan(args) -> int:
 
 def cmd_replay(args) -> int:
     from .acquisition.replay import replay
-    from .config.local_inputs import load_calibrations
-    from .contract.configuration import CaptureSpec, LocalInputs, translate
+    from .contract.configuration import CaptureSpec, LocalInputs, effective, parse_document
     from .contract.examples import example_configuration
 
+    cfg = example_configuration(mode=args.mode)
     if args.server_config:
+        # Operational settings from a server document; the profile is the built-in example for --mode.
         result = json.loads(Path(args.server_config).read_text())
         channel = args.channel or result["configuration"]["channels"][0]["channel"]
-        local = LocalInputs(channel=channel, capture=CaptureSpec(),
-                            gain_reference_check="file replay: no physical gain",
-                            calibrations=load_calibrations(Path(args.calibrations)) if args.calibrations else {})
-        cfg = translate(result, local)
-    else:
-        cfg = example_configuration(mode=args.mode)
+        local = LocalInputs(channel=channel, capture=CaptureSpec(), gain_reference_check="file replay: no physical gain")
+        cfg = effective(parse_document(result, local), cfg.profile)
     state = Path(args.state_dir or f"./replay-state-{int(time.time())}")
     pattern = [int(x) for x in args.block_pattern.split(",")] if args.block_pattern else None
     res = replay(args.file, state, cfg, start_utc=args.start_utc, block_pattern=pattern, seed=args.seed)
@@ -452,7 +452,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--state-dir")
     sp.add_argument("--server-config", help="a GET /configuration response body (default: built-in example)")
     sp.add_argument("--channel", help="channel name in --server-config (default: first)")
-    sp.add_argument("--calibrations", help="calibrations.toml with scales for --server-config")
     sp.add_argument("--mode", default="calibrated", choices=["uncalibrated", "estimated", "calibrated"])
     sp.add_argument("--start-utc", type=float, default=1_790_000_000.0)
     sp.add_argument("--block-pattern")

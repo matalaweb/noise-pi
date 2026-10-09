@@ -1,8 +1,8 @@
 """``noise-collector umik``: read-only setup report for a miniDSP UMIK-1.
 
 Prints what the device reports (analog gain, native format, mixer state), what its calibration
-file says (serial, Sens Factor, AGain, orientation), the local settings to use, and the values to
-enter in the web app (profile serial, an *estimated* calibration record). Nothing is changed.
+file says (serial, Sens Factor, AGain, orientation) and the ``collector.toml`` settings to use. The
+collector reports its profile and calibration to the server itself. Nothing is changed.
 """
 
 from __future__ import annotations
@@ -80,18 +80,17 @@ def report(cal_file: str | None = None) -> dict:
                                 "they must match (use the file for this gain setting)")
         if cal["sens_factor_db"] is not None:
             est = umik1.sensitivity_estimate(cal["sens_factor_db"], mixer_gain)
-            out["web_app"] = {
-                "measurement_profile": {"microphone_model": "miniDSP UMIK-1", "microphone_serial": cal["serial"],
-                                        "sample_rate_hz": 48000, "gain_description": f"UMIK-1 analog {device_again if device_again is not None else cal['again_db']} dB; ALSA Mic 0.00 dB"},
-                "calibration_record": {
-                    "calibration_state": "estimated",
-                    "reference_method": "UMIK-1 calibration file Sens Factor (REW convention), not yet confirmed with a calibrator",
-                    "sensitivity_dbfs_at_94db": est["sensitivity_dbfs_at_94db"],
-                    "gain_configuration": f"analog {device_again if device_again is not None else cal['again_db']} dB; Mic capture 0.00 dB",
-                    "attach": f"{Path(cal_file).name} as 'Microphone frequency-response file'",
+            out["collector_toml"] = {
+                "microphone": {"model": "umik-1"},
+                "calibration": {
+                    "state": "estimated",
+                    "frequency_response_file": f"/etc/noise-collector/{Path(cal_file).name}",
+                    # Omit sensitivity_dbfs_at_94db to derive it from the file (same value, REW convention).
                 },
-                "estimate": est,
             }
-            out["notes"].append("the sensitivity above is an estimate: after a 94 dB / 1 kHz calibrator check (calibration-check), "
-                                "create a 'calibrated' record with the measured value")
+            out["estimate"] = est
+            out["notes"].append(f"copy {Path(cal_file).name} to /etc/noise-collector/ and set the [calibration] above; the "
+                                "collector reports the profile and calibration to the server itself")
+            out["notes"].append("the sensitivity is an estimate: after a 94 dB / 1 kHz calibrator check (calibration-check), "
+                                "set state = \"calibrated\" with the measured value")
     return out

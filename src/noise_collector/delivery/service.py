@@ -28,7 +28,7 @@ import httpx
 from .. import __version__
 from ..config.local_inputs import local_inputs
 from ..config.settings import Settings, load_token
-from ..contract.configuration import COMPUTED_METRICS, DeliverySettings, DeviceConfiguration, translate
+from ..contract.configuration import COMPUTED_METRICS, DeliverySettings, Operational, local_defaults, parse_document
 from ..contract.models import (
     BatchResult,
     Capabilities,
@@ -66,7 +66,7 @@ from ..transport.api import (
     token_fingerprint,
 )
 from ..transport.backoff import RateLimiter, next_delay
-from . import config_manager, outbox, retention
+from . import config_manager, outbox, provenance, retention
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +78,7 @@ MAX_CHECKSUM_REUPLOADS = 3
 STATUS_STALE_S = 15.0
 CLOCK_HOLD_S = 600.0
 REFRESH_HOLD_S = 300.0
+UNKNOWN_PROVENANCE_HOLD_S = 30.0
 REUPLOADABLE_FAILURES = {"sha256_mismatch", "size_mismatch", "object_missing", "unreadable_media"}
 
 
@@ -128,30 +129,30 @@ class DeliveryService:
         self.lane_errors: dict[str, str] = {}
         self.status_path = run_dir(settings.state_dir) / "delivery-status.json"
         self.started = time.monotonic()
-        self._eff_cache: tuple[int, DeviceConfiguration | None] | None = None
+        self._eff_cache: tuple[int | None, Operational] | None = None
         self._dropped_at_last_hb: int | None = None
 
     # ------------------------------------------------------------------ helpers
 
-    def effective(self, conn: sqlite3.Connection) -> DeviceConfiguration | None:
+    def operational(self, conn: sqlite3.Connection) -> Operational:
+        """Operational settings in force: the applied revision, or the local defaults before one exists."""
         row = conn.execute(
             "SELECT revision, document_json FROM configurations WHERE state='applied' ORDER BY revision DESC LIMIT 1"
         ).fetchone()
-        if row is None:
-            return None
-        if self._eff_cache and self._eff_cache[0] == row["revision"]:
+        rev = row["revision"] if row is not None else None
+        if self._eff_cache and self._eff_cache[0] == rev:
             return self._eff_cache[1]
-        try:
-            eff = translate(json.loads(row["document_json"]), local_inputs(self.s), verify_hash=False)
-        except Exception as exc:  # the acquisition process applied it, so this should not happen
-            log.error("applied configuration %s cannot be translated: %s", row["revision"], exc)
-            eff = None
-        self._eff_cache = (row["revision"], eff)
-        return eff
+        op = local_defaults(local_inputs(self.s))
+        if row is not None:
+            try:
+                op = parse_document(json.loads(row["document_json"]), local_inputs(self.s), verify_hash=False)
+            except Exception as exc:  # the acquisition process applied it, so this should not happen
+                log.error("applied configuration %s cannot be parsed: %s", row["revision"], exc)
+        self._eff_cache = (rev, op)
+        return op
 
     def _delivery_settings(self, conn: sqlite3.Connection) -> DeliverySettings:
-        eff = self.effective(conn)
-        return eff.delivery if eff else DeliverySettings()
+        return self.operational(conn).delivery
 
     def _delay(self, attempts: int, out: Outcome) -> float:
         if out.retry_after is not None and out.status == 429:
@@ -163,11 +164,24 @@ class DeliveryService:
         set_meta_tx(conn, "auth_blocked_fingerprint", self.auth.fingerprint or "")
         bump_counter(conn, "auth_rejections", 1, out.error_code)
 
+    def _register_provenance(self, conn: sqlite3.Connection, now: float) -> bool:
+        """Register pending measurement-chain records; True when nothing referenced is unregistered."""
+        result, out = provenance.register(self.api, conn, now, self._delay)
+        if result != "idle":
+            self.lane_errors["provenance_last"] = result
+        if result == "auth" and out is not None:
+            self._auth(conn, out)
+        return provenance.pending_count(conn) == 0
+
     def _hold(self, conn: sqlite3.Connection, out: Outcome) -> float:
         """Delay for the server's non-backoff retry hints; schedules a config refresh when asked."""
         if out.kind == AFTER_CONFIG_REFRESH:
             self.next_config = 0.0
             bump_counter(conn, "unknown_provenance_rejections", 1, out.error_code)
+            if out.error_code == "unknown_provenance":
+                # Register the chain again (idempotent), then resubmit shortly.
+                provenance.reregister_all(conn)
+                return UNKNOWN_PROVENANCE_HOLD_S
             return REFRESH_HOLD_S
         bump_counter(conn, "clock_rejections", 1, out.error_code)
         return CLOCK_HOLD_S
@@ -208,8 +222,9 @@ class DeliveryService:
         if self.auth.blocked:
             return
         self._send_acks(conn, now)
-        self._send_events(conn, now)
-        self._send_batch(conn, now)
+        if self._register_provenance(conn, now):
+            self._send_events(conn, now)
+            self._send_batch(conn, now)
         if now >= self.next_config:
             self._poll_config(conn)
             self.next_config = now + ds.config_poll_seconds * self.rng.uniform(0.8, 1.2)
@@ -218,13 +233,13 @@ class DeliveryService:
             self.next_heartbeat = now + ds.heartbeat_seconds * self.rng.uniform(0.9, 1.1)
 
     def _retention(self, conn: sqlite3.Connection, now: float) -> None:
-        eff = self.effective(conn)
+        op = self.operational(conn)
         try:
             st = measure(self.s.state_dir, self.s.storage)
             retention.run(
                 conn, self.s.state_dir, self.s.storage, st.state, now,
-                ack_days=eff.retention.acknowledged_measurement_days if eff else None,
-                audio_hours=eff.retention.verified_audio_days * 24 if eff else None,
+                ack_days=op.retention.acknowledged_measurement_days,
+                audio_hours=op.retention.verified_audio_days * 24,
             )
         except OSError as exc:
             self.lane_errors["retention"] = str(exc)
@@ -722,6 +737,7 @@ class DeliveryService:
             "desired_revision": self.desired_revision,
             "lane_errors": self.lane_errors,
             "backlog": outbox.backlog(conn),
+            "provenance": provenance.summary(conn),
         })
 
     def run(self) -> int:

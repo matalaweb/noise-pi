@@ -3,6 +3,9 @@ Description=Noise monitoring collector (capture + delivery)
 Documentation=file:///opt/noise-collector/docs/operations.md
 Wants=network-online.target time-sync.target
 After=network-online.target time-sync.target sound.target
+# Backoff: at most 5 restarts per 10 minutes before systemd gives up and the unit shows failed.
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=notify
@@ -16,9 +19,6 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/noise-collector/venv/bin/noise-collector run
 Restart=always
 RestartSec=5
-# Backoff: at most 5 restarts per 10 minutes before systemd gives up and the unit shows failed.
-StartLimitIntervalSec=600
-StartLimitBurst=5
 # Fed only while acquisition reports progressing capture/storage work.
 WatchdogSec=60
 # Children get 30 s to persist metadata, finalize interrupted recordings and release the microphone.

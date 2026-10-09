@@ -32,6 +32,12 @@ QualityFlag = Literal[
     "clipping", "audio_dropout", "microphone_disconnected", "unsynchronized_clock", "below_noise_floor",
     "invalid_calibration", "processing_error", "incomplete_interval",
 ]
+# Events may also carry ``max_duration_reached`` (ended at detection.max_event_duration_seconds)
+# and ``ended_by_operator`` (stopped by the owner on the device).
+EventQualityFlag = Literal[
+    "clipping", "audio_dropout", "microphone_disconnected", "unsynchronized_clock", "below_noise_floor",
+    "invalid_calibration", "processing_error", "incomplete_interval", "max_duration_reached", "ended_by_operator",
+]
 MetricName = Literal["laeq_db", "lafmax_db", "lceq_db", "lcpeak_db", "low_frequency_leq_db", "rms_dbfs"]
 UUID_RE = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 CHANNEL_RE = r"^[A-Za-z0-9._-]{1,32}$"
@@ -78,10 +84,10 @@ class MeasurementRecord(Outbound):
     channel: str = Field(pattern=CHANNEL_RE)
     captured_at: str
     duration_ms: Literal[1000] = 1000
-    deployment_id: str = Field(pattern=UUID_RE)
+    # No deployment_id: the server assigns the placement in effect at captured_at.
     profile_id: str = Field(pattern=UUID_RE)
     calibration_id: str | None
-    configuration_revision: int = Field(ge=1)
+    configuration_revision: int | None = Field(ge=1)  # None: local defaults, no configuration applied
     laeq_db: float | None
     lafmax_db: float | None
     lceq_db: float | None
@@ -148,17 +154,16 @@ class EventRevision(Outbound):
     revision: int = Field(ge=1)
     sent_at: str | None = None
     channel: str = Field(pattern=CHANNEL_RE)
-    deployment_id: str = Field(pattern=UUID_RE)
     profile_id: str = Field(pattern=UUID_RE)
     calibration_id: str | None
-    configuration_revision: int = Field(ge=1)
+    configuration_revision: int | None = Field(ge=1)
     detection_state: Literal["open", "finalized"]
     started_at: str
     ended_at: str | None
     detection: Detection
     summary: EventSummary
     recording: EventRecordingInfo
-    quality_flags: list[QualityFlag]
+    quality_flags: list[EventQualityFlag]
 
 
 class EventResult(Envelope):
@@ -299,3 +304,61 @@ class HeartbeatResult(Envelope):
     configuration_pending: bool = False
     heartbeat_interval_seconds: int | None = None
     reporting_interval_seconds: int | None = None
+
+
+# ---------------------------------------------------------------------------- device-reported provenance
+# POST /api/v1/device/provenance (contract/device-reported-provenance.md)
+
+
+class ProvenanceAttachment(Outbound):
+    purpose: Literal["frequency_response"]
+    filename: str = Field(min_length=1, max_length=255)
+    media_type: str = Field(max_length=127)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    content_base64: str
+
+
+class ProvenanceProfile(Outbound):
+    id: str = Field(pattern=UUID_RE)
+    channel: str = Field(pattern=CHANNEL_RE)
+    name: str | None = Field(max_length=255)
+    microphone_model: str = Field(min_length=1, max_length=255)
+    microphone_serial: str | None = Field(max_length=255)
+    audio_interface: str | None = Field(max_length=255)
+    sample_rate_hz: int = Field(gt=0)
+    gain_db: float | None
+    gain_description: str | None = Field(max_length=255)
+    weighting_implementation_version: str = Field(min_length=1, max_length=64)
+    filter_implementation_version: str = Field(min_length=1, max_length=64)
+    agent_processing_version: str = Field(min_length=1, max_length=64)
+    calibration_state: Literal["uncalibrated", "estimated", "calibrated"]
+    calibration_application_method: str | None = Field(max_length=255)
+    supported_metrics: list[MetricName] = Field(min_length=1)
+    low_frequency_lower_hz: float | None
+    low_frequency_upper_hz: float | None
+    band_centers_hz: list[float]
+
+
+class ProvenanceCalibration(Outbound):
+    id: str = Field(pattern=UUID_RE)
+    channel: str = Field(pattern=CHANNEL_RE)
+    calibration_state: Literal["estimated", "calibrated"]
+    reference_method: str = Field(min_length=1, max_length=255)
+    reference_device: str | None = Field(max_length=255)
+    reference_level_db: float | None
+    reference_frequency_hz: float | None
+    sensitivity_mv_per_pa: float | None
+    sensitivity_dbfs_at_94db: float | None
+    gain_configuration: str | None = Field(max_length=255)
+    application_method: str | None = Field(max_length=255)
+    performed_at: str | None
+    performed_by: str | None = Field(max_length=255)
+    notes: str | None
+    attachments: list[ProvenanceAttachment] = Field(max_length=4)
+
+
+class ProvenanceRegistration(Outbound):
+    schema_version: Literal[1] = SCHEMA_VERSION
+    sent_at: str
+    measurement_profiles: list[ProvenanceProfile] = Field(max_length=8)
+    calibrations: list[ProvenanceCalibration] = Field(max_length=8)

@@ -155,7 +155,50 @@ def test_umik_report(tmp_path, monkeypatch):
     assert dev["analog_gain_db"] == 18 and dev["usb_serial_is_placeholder"] and dev["mixer_ok"]
     assert dev["suggested_settings"]["capture"]["channels"] == 2 and dev["suggested_settings"]["microphone"]["usb_path"] == "1-1.2.1"
     assert rep["calibration_file"]["orientation"] == "90deg" and rep["calibration_file"]["serial"] == "7103946"
-    web = rep["web_app"]
-    assert web["measurement_profile"]["microphone_serial"] == "7103946"
-    assert web["calibration_record"]["calibration_state"] == "estimated"
-    assert web["calibration_record"]["sensitivity_dbfs_at_94db"] == pytest.approx(-30.837)
+    toml = rep["collector_toml"]
+    assert toml["microphone"] == {"model": "umik-1"}
+    assert toml["calibration"] == {"state": "estimated", "frequency_response_file": "/etc/noise-collector/7103946_90deg.txt"}
+    assert rep["estimate"]["sensitivity_dbfs_at_94db"] == pytest.approx(-30.837)
+
+
+# Captured from a newer-revision unit (bcdDevice 1.23) on a Raspberry Pi 4B, Debian 13, 2026-10-09.
+STREAM_NEW_REV = """miniDSP Ltd. UMIK-1 at usb-0000:01:00.0-1.2, full speed : USB Audio
+
+Capture:
+  Status: Stop
+  Interface 1
+    Altset 1
+    Format: S24_3LE
+    Channels: 1
+    Endpoint: 0x86 (6 IN) (ASYNC)
+    Rates: 48000
+    Bits: 24
+    Channel map: MONO
+"""
+AMIXER_NEW_REV = """Simple mixer control 'Mic',0
+  Capabilities: cvolume cvolume-joined cswitch cswitch-joined
+  Capture channels: Mono
+  Limits: Capture 0 - 127
+  Mono: Capture 127 [100%] [0.00dB] [on]
+"""
+
+
+def test_newer_revision_without_gain_in_product_string(tmp_path):
+    root = tmp_path
+    usbdev = root / "sys/devices/platform/usb1/1-1.2"
+    (usbdev / "1-1.2:1.0").mkdir(parents=True)
+    for name, value in {"idVendor": "2752", "idProduct": "0007", "manufacturer": "miniDSP Ltd.", "product": "UMIK-1", "serial": "1"}.items():
+        (usbdev / name).write_text(value + "\n")
+    (root / "sys/class/sound/card3").mkdir(parents=True)
+    (root / "sys/class/sound/card3/device").symlink_to(usbdev / "1-1.2:1.0")
+    (root / "proc/asound/card3").mkdir(parents=True)
+    (root / "proc/asound/card3/id").write_text("UMIK1\n")
+    (root / "proc/asound/card3/stream0").write_text(STREAM_NEW_REV)
+    d = match(list_usb_audio(root / "sys", root / "proc"), MicrophoneSelector(model="umik-1", usb_path="1-1.2"))
+    assert d.card_id == "UMIK1" and umik1.is_umik1(d.vendor_id, d.product_id, d.product)
+    assert umik1.analog_gain_db(d.product) is None and umik1.real_serial(d.serial) is None
+    assert parse_stream_formats(d.stream_info) == [{"format": "S24_3LE", "channels": 1, "rates": [48000]}]
+    controls, _ = parse_scontents(AMIXER_NEW_REV)
+    ok, note = umik1.gain_check(GainReading(True, controls), d.product, 18.0)
+    assert ok and "does not report its analog gain" in note
+    assert umik1.gain_check(GainReading(True, controls), d.product, None) == (True, None)

@@ -20,15 +20,17 @@ from ..audio.gain import compare, read_gain
 from ..audio import umik1
 from ..audio.alsa_source import CaptureError
 from ..audio.pcm import PcmFormat
+from ..config.chain import ChainError, LocalChain, build_chain, installation_id, store_records
 from ..config.settings import Settings
 from ..config.local_inputs import local_inputs
-from ..contract.configuration import ConfigRejected, DeviceConfiguration, translate
+from ..contract.configuration import ConfigRejected, DeviceConfiguration, Operational, effective, local_defaults, parse_document
 from ..storage import StorageState, measure
 from ..store.db import connect, get_meta, migrate
 from ..store.lock import InstanceLock
 from ..timing.clock import SystemClock
 from ..timing.mapper import TimingSettings
 from ..timeutil import iso_utc
+from ..health.control import take_stop_event_request
 from ..health.status import host_health, os_boot_id, run_dir, write_status
 from .durability import DurabilityApplier, QueuedSink, high_water_key
 from .engine import AcquisitionEngine, EngineLocalSettings, GainState
@@ -55,15 +57,15 @@ def check_native_format(dev, fmt: PcmFormat) -> None:
                            "(set [capture] channels to the native count)")
 
 
-def load_config_row(conn, state: str, settings: Settings) -> tuple[int, DeviceConfiguration] | None:
-    """Latest configuration in ``state`` translated against current local inputs (raises ConfigRejected)."""
+def load_config_row(conn, state: str, settings: Settings) -> tuple[int, Operational] | None:
+    """Latest configuration in ``state`` parsed against current local inputs (raises ConfigRejected)."""
     row = conn.execute(
         "SELECT revision, document_json FROM configurations WHERE state=? ORDER BY revision DESC LIMIT 1", (state,)
     ).fetchone()
     if row is None:
         return None
     try:
-        return row["revision"], translate(json.loads(row["document_json"]), local_inputs(settings), verify_hash=state == "staged")
+        return row["revision"], parse_document(json.loads(row["document_json"]), local_inputs(settings), verify_hash=state == "staged")
     except ConfigRejected as exc:
         exc.revision = row["revision"]  # type: ignore[attr-defined]
         raise
@@ -85,6 +87,8 @@ class AcquisitionRunner:
         self.status_path = run_dir(settings.state_dir) / "acquisition-status.json"
         self.started_mono = time.monotonic()
         self.last_block_mono: float | None = None
+        self.chain: LocalChain | None = None
+        self.chain_error: str | None = None
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -100,6 +104,7 @@ class AcquisitionRunner:
             self.conn = connect(s.db_path)
             self.reader = connect(s.db_path)
             recover_state(self.conn, s.state_dir, None)
+            self._build_chain(self.conn)
             # The durability thread owns ``self.conn`` from here on.
             self.conn.close()
             dconn = connect(s.db_path, check_same_thread=False)
@@ -164,7 +169,19 @@ class AcquisitionRunner:
         log.error("rejecting configuration %s: %s %s", cfg_rev, code, detail)
         self.sink.submit(ConfigApplied(cfg_rev, "rejected", None, code, detail[:1800]))
 
-    def _load(self, state: str) -> tuple[int, DeviceConfiguration] | None:
+    def _build_chain(self, conn) -> None:
+        """The local measurement chain (profile + calibration), queued for registration with the server."""
+        try:
+            self.chain = build_chain(self.s, installation_id(conn))
+        except ChainError as exc:
+            self.chain_error = str(exc)
+            log.error("measurement chain unusable: %s", exc)
+            return
+        store_records(conn, self.chain)
+        log.info("measurement chain: profile %s (%s), calibration %s", self.chain.profile.profile_id, self.chain.profile.mode,
+                 self.chain.profile.calibration_id)
+
+    def _load(self, state: str) -> tuple[int, Operational] | None:
         try:
             return load_config_row(self.reader, state, self.s)
         except ConfigRejected as exc:
@@ -177,46 +194,34 @@ class AcquisitionRunner:
             return None
 
     def _poll_config(self) -> None:
+        if self.chain is None:
+            self.mic_state = "local_config_error"
+            self.latest_error = self.chain_error
+            return
         staged = self._load("staged")
         if self.engine is None:
             current = staged or self._load("applied")
-            if current is None:
-                self.mic_state = "not_configured"
-                return
-            rev, cfg = current
+            rev, op = current if current is not None else (None, local_defaults(local_inputs(self.s)))
+            cfg = effective(op, self.chain.profile, self.chain.notes)
             try:
                 self.engine = self._build_engine(cfg)
             except ValueError as exc:
-                if staged:
+                if staged and rev is not None:
                     self._reject(rev, "incompatible_configuration", str(exc))
                 else:
-                    self.latest_error = f"applied configuration unusable: {exc}"
+                    self.latest_error = f"configuration unusable: {exc}"
                 return
             self.requested_revision = rev
-            if staged:
+            if staged and rev is not None:
                 self.sink.submit(ConfigApplied(rev, "applied", iso_utc(time.time()), None, self.engine.apply_notes(cfg), cfg.sha256))
             return
         if staged is None:
             return
-        rev, cfg = staged
-        if rev == self.requested_revision or rev <= self.engine.config.revision:
+        rev, op = staged
+        if rev == self.requested_revision or rev <= (self.engine.config.revision or 0):
             return
         self.requested_revision = rev
-        if fmt_from_profile(cfg) != self.engine.fmt:
-            # Capture format change: end the stream and rebuild with the new format.
-            log.info("capture format change in revision %s; restarting capture", rev)
-            if self.capture is not None:
-                self.capture.stop()
-                self.capture = None
-            self.engine.stop_stream("configuration_format_change")
-            try:
-                self.engine = self._build_engine(cfg)
-            except ValueError as exc:
-                self._reject(rev, "incompatible_configuration", str(exc))
-                return
-            self.sink.submit(ConfigApplied(rev, "applied", iso_utc(time.time()), None, self.engine.apply_notes(cfg), cfg.sha256))
-            return
-        self.engine.request_config(cfg)
+        self.engine.request_config(effective(op, self.chain.profile, self.chain.notes))
 
     # ------------------------------------------------------------------ device
 
@@ -252,7 +257,8 @@ class AcquisitionRunner:
             u_ok, u_note = umik1.gain_check(reading, dev.product, self.engine.profile.calibration_file_again_db)
             ok = ok and u_ok
             note = "; ".join(n for n in (note, u_note) if n) or None
-            return GainState(ok=ok, inspectable=True, observed=dict(reading.controls, analog_gain_db=str(umik1.analog_gain_db(dev.product))),
+            again = umik1.analog_gain_db(dev.product)
+            return GainState(ok=ok, inspectable=True, observed=dict(reading.controls, analog_gain_db="unreported" if again is None else str(again)),
                              note=note)
         if reading.auto_controls:
             note = (note + "; " if note else "") + f"automatic processing controls present: {reading.auto_controls}"
@@ -343,6 +349,7 @@ class AcquisitionRunner:
 
     def _periodic(self) -> None:
         self._poll_config()
+        self._take_control_requests()
         now = time.monotonic()
         if now - self.storage_checked >= 5.0:
             self.storage_checked = now
@@ -351,6 +358,15 @@ class AcquisitionRunner:
             except OSError as exc:
                 self.latest_error = f"storage check failed: {exc}"
         self._write_status()
+
+    def _take_control_requests(self) -> None:
+        event_id = take_stop_event_request(self.s.state_dir)
+        if event_id is None:
+            return
+        if self.engine is not None and self.engine.force_end_event(event_id):
+            log.info("event %s stopped by the owner from the local dashboard", event_id)
+        else:
+            log.info("stop request for event %s ignored: it is not the open event", event_id)
 
     def _write_status(self) -> None:
         backlog = self.sink.backlog() if getattr(self, "sink", None) else None

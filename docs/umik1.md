@@ -10,13 +10,13 @@ they rest on secondary sources. Everything here still has to be confirmed on the
 
 | Item | Value | Basis |
 |---|---|---|
-| USB id | `2752:0007`, manufacturer `miniDSP` | confirmed (lsusb/dmesg captures) |
-| Product string | `Umik-1  Gain: 18dB` (two spaces). The number is the internal analog gain: 18 dB on current units, 12 or 0 dB on older ones. | confirmed |
-| ALSA card id | Derived from the product string by the kernel (`U18dB`, `U0dB`, ...). **Never used for matching.** | confirmed (sound/core/init.c) |
+| USB id | `2752:0007`, manufacturer `miniDSP` (older) or `miniDSP Ltd.` (newer) | confirmed (lsusb/dmesg captures; our unit) |
+| Product string | Older units: `Umik-1  Gain: 18dB` (two spaces; the number is the internal analog gain, 18, 12 or 0 dB). **Newer revision (bcdDevice 1.23): just `UMIK-1`, no gain.** | confirmed (our unit, 2026-10-09) |
+| ALSA card id | Derived from the product string by the kernel (`U18dB`, `U0dB`, `UMIK1`, ...). **Never used for matching.** | confirmed (sound/core/init.c) |
 | USB serial | A placeholder (`000-0000`, or `1`) on every unit | confirmed |
 | Real serial | The 7-digit number on the body and in the calibration file (`SERNO`) | confirmed |
-| Format | UAC1, **S24_3LE, 48 kHz only**, synchronous endpoint | confirmed (descriptor) |
-| Channels | **2 on most units** (same signal on both); **some units are mono** | confirmed (both kinds seen) |
+| Format | UAC1, **S24_3LE, 48 kHz only**. Older units: synchronous endpoint; newer revision: asynchronous | confirmed (descriptors; our unit) |
+| Channels | **2 on older units** (same signal on both); **mono on others, including the newer revision** | confirmed (both kinds seen; ours is mono) |
 | Mixer | `Mic` capture volume + switch. On USB-C units, 0..127 = −63.5..**0.00 dB** (a real digital gain). No automatic gain control. | corroborated |
 | Calibration files | `<serial>.txt` (0°, pointing at the source) and `<serial>_90deg.txt` (90°, pointing up). First line e.g. `"Sens Factor =-0.837dB, AGain =18dB, SERNO: 7103946"` (`AGain` absent in older files), then `Hz dB` lines from about 10 Hz. The curve is the microphone's response; correction subtracts it. | confirmed |
 
@@ -25,20 +25,24 @@ they rest on secondary sources. Everything here still has to be confirmed on the
 * **Identity.** It matches `2752:0007` with a `Umik-1` product string. The USB serial is ignored,
   because it is a placeholder. The physical port is pinned with `usb_path`. Without a `usb_path`,
   the collector uses the UMIK-1 only if exactly one is connected; with two it refuses. The real
-  microphone identity is the **calibration file's `SERNO`, which must equal the web-app profile's
-  microphone serial**. Otherwise the configuration is rejected.
+  microphone identity is the **calibration file's `SERNO`**, reported as the profile's microphone
+  serial. If `[microphone] microphone_serial` is also set and differs, the collector refuses the
+  file (it belongs to another microphone).
 * **Format.** It captures S24_3LE at the native channel count (`[capture] channels`, usually 2) and
   analyses channel 0. The channels are compared on every block and never averaged; a mismatch shows
   in the status file (`channel_mismatch_blocks`). A wrong channel count is reported as
   `format_mismatch` instead of opening the device.
 * **Gain.** It reads the mixer back every 30 s. `Mic` must be at the **0.00 dB step and on**. The
-  product string's analog gain must equal the calibration file's `AGain`. If either check fails,
+  product string's analog gain must equal the calibration file's `AGain` (a newer-revision unit does
+  not report its gain; that is noted in the status, not failed). If either check fails,
   SPL fields go out `null` with `null_reasons: gain_mismatch` and the flag `invalid_calibration`
   under the same profile; dBFS continues.
-* **Response correction.** It applies the serial-specific file attached to the calibration record in
-  the web app. The file is downloaded with the device token and SHA-256-verified. The curve is
-  normalized to 0 dB at 1 kHz and realized as a bounded minimum-phase FIR. With both files
-  attached, `calibration_orientation` picks 0° or 90°.
+* **Response correction.** It applies `[calibration] frequency_response_file` (the 0° or the 90°
+  file, matching how the microphone is mounted). The curve is normalized to 0 dB at 1 kHz and
+  realized as a bounded minimum-phase FIR. The file is registered with the server with its SHA-256.
+* **Profile and calibration.** The collector reports both to the server itself (model
+  `miniDSP UMIK-1`, the file's serial, an *estimated* sensitivity of `Sens Factor - 30` unless
+  `sensitivity_dbfs_at_94db` is set). Nothing is entered in the web app except the placement.
 
 ## Setup, step by step
 
@@ -49,38 +53,39 @@ they rest on secondary sources. Everything here still has to be confirmed on the
    ```bash
    sudo -u noise-collector noise-collector umik --cal-file 7103946_90deg.txt
    ```
-   This prints the card, `usb_path`, analog gain, native channel count, mixer state, the settings to
-   use, and the values to enter in the web app. It changes nothing.
+   This prints the card, `usb_path`, analog gain, native channel count, mixer state and the
+   `collector.toml` settings to use. It changes nothing.
 3. **Mixer to 0 dB:**
    ```bash
    amixer -c <card> sset Mic 100% unmute   # verify it reads [0.00dB] [on]
    sudo alsactl store                      # persist across reboots
    ```
-4. **Local settings** (`/etc/noise-collector/collector.toml`, see `deploy/collector.example.toml`):
+4. **Calibration file.** Download the current calibration files for your serial from miniDSP (some
+   files were corrected around 2021 without a name change, so re-download old copies) and copy the
+   one matching the mounting to `/etc/noise-collector/`.
+5. **Local settings** (`/etc/noise-collector/collector.toml`, see `deploy/collector.example.toml`):
    ```toml
    [microphone]
    model = "umik-1"
    usb_path = "1-1.2"                 # from step 2
-   calibration_orientation = "90deg"  # match how the microphone is mounted
    [capture]
    container = "int24"
    valid_bits = 24
-   channels = 2                       # 1 on mono units (step 2 tells)
+   channels = 1                       # native count from step 2 (older units: 2)
    analysis_channel = 0
+   [calibration]
+   state = "estimated"
+   frequency_response_file = "/etc/noise-collector/7213485_90deg.txt"
    ```
-5. **Web app.** Download the current calibration files for your serial from miniDSP. Some files
-   were corrected around 2021 without a name change, so re-download old copies. Then:
-   * **Measurement profile:** microphone model `miniDSP UMIK-1`, **microphone serial = the 7-digit
-     serial**, sample rate 48000, low-frequency band 20–125 Hz.
-   * **Calibration record:** either *estimated* or *calibrated*.
-     - *Estimated:* `Level at 94 dB SPL` = the `sensitivity_dbfs_at_94db` value from step 2.
-     - *Calibrated:* a measured value from a 94 dB / 1 kHz acoustic calibrator. Stop the service and
-       run `noise-collector calibration-check --level 94`. Its `calibrations_toml_entry_hint` shows
-       the measured `sensitivity_dbfs_at_94db`.
-     - Set gain configuration to e.g. "analog 18 dB; Mic capture 0.00 dB".
-     - **Attach** the calibration file(s) as *Microphone frequency-response file*.
-   * Publish a configuration referencing the profile, deployment, and calibration. Then run
-     `noise-collector doctor`.
+   Restart the service and run `noise-collector doctor`: it shows the measurement chain (model,
+   serial, estimated sensitivity) and its registration with the server. The collector measures
+   right away on local defaults (measurements only, no detection rules).
+6. **Web app.** Add a **placement** for the device (where the microphone is). Readings are assigned
+   the placement in effect at their capture time. Optionally publish a configuration for detection
+   rules, recording and intervals; profile and calibration need no entry.
+7. **Calibrated later:** with a 94 dB / 1 kHz acoustic calibrator, stop the service, run
+   `noise-collector calibration-check --level 94`, and copy its `collector_toml_calibration_hint`
+   into `[calibration]` (state `calibrated`, the measured sensitivity, reference method, date).
 
 ## Sensitivity: what is and isn't known
 
@@ -106,7 +111,8 @@ with the convention, and record the measured difference.
 * EBUSY on open: an audio server holds the device (see step 1). `lsof /dev/snd/*` shows who.
 * `hw:` can't convert format, rate, or channel count. The configured format must be native,
   which the collector checks.
-* Synchronous endpoint: the sample clock follows the host USB frame clock. The collector maps
+* Synchronous endpoint (older units): the sample clock follows the host USB frame clock; newer units
+  use an asynchronous endpoint with their own clock. The collector maps
   samples to UTC with drift tracking, never by sample count alone.
 
 ## Sources
